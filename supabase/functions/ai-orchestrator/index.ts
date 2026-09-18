@@ -1,94 +1,34 @@
+import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const cors = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
-  "Content-Type": "application/json",
-};
-const json=(body:unknown,status=200)=>new Response(JSON.stringify(body),{status,headers:cors});
-const sha=async(v:string)=>{const b=await crypto.subtle.digest("SHA-256",new TextEncoder().encode(v));return [...new Uint8Array(b)].map(x=>x.toString(16).padStart(2,"0")).join("")};
-
-function workersFor(prompt:string,available:any[]){
-  const p=prompt.toLowerCase(), keys=new Set<string>(["creative_strategist"]);
-  if(/video|youtube|tiktok|reel|short|film|ad/.test(p)) keys.add("video_creator");
-  if(/thumbnail|image|logo|design|visual|graphic/.test(p)) keys.add("brand_designer");
-  if(/voice|narrat|dub|vocal/.test(p)) keys.add("voice_creator");
-  if(/music|song|beat|soundtrack|amapiano/.test(p)) keys.add("music_creator");
-  if(/script|caption|copy|hook|title|description|lyrics/.test(p)) keys.add("copywriter");
-  if(/social|instagram|facebook|linkedin|twitter|x\.com|pinterest|publish|schedule/.test(p)) keys.add("social_manager");
-  if(/growth|analytics|performance|audience|engagement|metrics/.test(p)) keys.add("growth_analyst");
-  const enabled=new Set(available.filter(w=>w.enabled).map(w=>w.key));
-  return [...keys].filter(k=>enabled.has(k));
-}
-async function openaiText(key:string,prompt:string,worker:string){
-  const c=new AbortController();const t=setTimeout(()=>c.abort(),30000);
-  try{
-    const r=await fetch("https://api.openai.com/v1/responses",{method:"POST",signal:c.signal,
-      headers:{Authorization:"Bearer "+key,"Content-Type":"application/json"},
-      body:JSON.stringify({model:Deno.env.get("OPENAI_TEXT_MODEL")||"gpt-5-mini",
-        input:[{role:"system",content:[{type:"input_text",text:"You are the "+worker+" worker in Operator Creator. Produce useful production-ready text. Never claim media was generated unless a media provider actually generated it."}]},
-               {role:"user",content:[{type:"input_text",text:prompt}]}]})});
-    const d=await r.json().catch(()=>({}));
-    if(!r.ok)throw Object.assign(new Error(d?.error?.message||"OpenAI request failed"),{status:r.status});
-    return d.output_text||"";
-  }finally{clearTimeout(t)}
-}
-
-Deno.serve(async(req)=>{
-  if(req.method==="OPTIONS")return new Response("ok",{headers:cors});
-  if(req.method!=="POST")return json({error:"METHOD_NOT_ALLOWED"},405);
-  const auth=req.headers.get("Authorization");
-  if(!auth?.startsWith("Bearer "))return json({error:"UNAUTHORIZED_NO_AUTH_HEADER"},401);
-  const url=Deno.env.get("SUPABASE_URL")!,anon=Deno.env.get("SUPABASE_ANON_KEY")!;
-  const db=createClient(url,anon,{global:{headers:{Authorization:auth}}});
-  const {data:{user},error:ue}=await db.auth.getUser();
-  if(ue||!user)return json({error:"UNAUTHORIZED"},401);
-  const body=await req.json().catch(()=>null);
-  if(!body?.prompt&&!body?.task_id)return json({error:"PROMPT_OR_TASK_REQUIRED"},400);
-  const {data:defs,error:de}=await db.from("worker_definitions").select("*").eq("enabled",true);
-  if(de)return json({error:"WORKER_REGISTRY_FAILED",detail:de.message},500);
-  const prompt=String(body.prompt||"");
-  let workflowId=body.workflow_id||null,contentId=body.content_id||null;
-  if(!workflowId){
-    const {data:w,error:e}=await db.from("workflows").insert({user_id:user.id,prompt,status:"QUEUED",metadata:{orchestrator:"ai-orchestrator"}}).select().single();
-    if(e)return json({error:"WORKFLOW_CREATE_FAILED",detail:e.message},500); workflowId=w.id;
-  }
-  if(!contentId){
-    const {data:c,error:e}=await db.from("content").insert({user_id:user.id,title:prompt.slice(0,120)||"Operator Creator output",content_type:"production_request",status:"QUEUED",prompt,metadata:{workflow_id:workflowId}}).select().single();
-    if(e)return json({error:"CONTENT_CREATE_FAILED",detail:e.message},500); contentId=c.id;
-  }
-  const keys=workersFor(prompt,defs||[]),apiKey=Deno.env.get("OPENAI_API_KEY")||"",results:any[]=[];
-  for(let i=0;i<keys.length;i++){
-    const key=keys[i],def=(defs||[]).find(w=>w.key===key);
-    const external=["social_manager","voice_creator"].includes(key)||/\b(publish|post|schedule|upload)\b/i.test(prompt);
-    const idem=await sha(workflowId+":"+key+":"+prompt);
-    const {data:old}=await db.from("ai_worker_tasks").select("*").eq("user_id",user.id).eq("idempotency_key",idem).maybeSingle();
-    if(old){results.push({worker:key,task_id:old.id,status:old.status});continue}
-    const {data:task,error:te}=await db.from("ai_worker_tasks").insert({user_id:user.id,workflow_id:workflowId,worker_key:key,task_type:def?.task_type||"text",prompt,status:"QUEUED",idempotency_key:idem,metadata:{external_action:external}}).select().single();
-    if(te){results.push({worker:key,status:"FAILED",error:te.message});continue}
-    await db.from("workflow_steps").insert({user_id:user.id,workflow_id:workflowId,worker:key,step_order:i+1,status:"QUEUED",task_id:task.id,metadata:{external_action:external}});
-    if(external||!["creative_strategist","copywriter"].includes(key)||!apiKey){
-      const reason=external?"approval_or_oauth_required":!apiKey?"provider_not_configured":"worker_provider_not_configured";
-      await db.from("ai_worker_tasks").update({status:"PROVIDER_NOT_CONFIGURED",completed_at:new Date().toISOString(),error_message:reason}).eq("id",task.id);
-      results.push({worker:key,task_id:task.id,status:"PROVIDER_NOT_CONFIGURED",reason});continue;
-    }
-    await db.from("ai_worker_tasks").update({status:"PROCESSING",started_at:new Date().toISOString()}).eq("id",task.id);
-    try{
-      const output=await openaiText(apiKey,prompt,key);
-      const {data:v}=await db.from("content_versions").insert({user_id:user.id,content_id:contentId,version_number:1,body:output,metadata:{worker:key,task_id:task.id}}).select().single();
-      await db.from("ai_worker_tasks").update({status:"COMPLETED",completed_at:new Date().toISOString(),output:{text:output,content_version_id:v?.id||null}}).eq("id",task.id);
-      await db.from("workflow_steps").update({status:"COMPLETED",completed_at:new Date().toISOString()}).eq("task_id",task.id);
-      results.push({worker:key,task_id:task.id,status:"COMPLETED",output});
-    }catch(e:any){
-      const retryable=[408,409,429,500,502,503,504].includes(e?.status||500);
-      await db.from("ai_worker_tasks").update({status:"FAILED",completed_at:new Date().toISOString(),error_message:e?.message||"Provider failure",metadata:{retryable}}).eq("id",task.id);
-      await db.from("workflow_steps").update({status:"FAILED",completed_at:new Date().toISOString()}).eq("task_id",task.id);
-      results.push({worker:key,task_id:task.id,status:"FAILED",retryable,error:e?.message||"Provider failure"});
-    }
-  }
-  const failed=results.some(x=>x.status==="FAILED"),done=results.some(x=>x.status==="COMPLETED");
-  await db.from("workflows").update({status:failed&&!done?"FAILED":"PROCESSING",metadata:{orchestrator:"ai-orchestrator",worker_count:results.length}}).eq("id",workflowId).eq("user_id",user.id);
-  await db.from("audit_events").insert({user_id:user.id,event_type:"workflow_orchestrated",entity_type:"workflow",entity_id:workflowId,metadata:{workers:keys,results:results.map(x=>({worker:x.worker,status:x.status}))}});
-  return json({workflow_id:workflowId,content_id:contentId,results});
-});
+const headers={"Content-Type":"application/json","Access-Control-Allow-Origin":"*","Access-Control-Allow-Headers":"authorization,apikey,content-type","Access-Control-Allow-Methods":"POST,OPTIONS"};
+const json=(body:any,status=200)=>new Response(JSON.stringify(body),{status,headers});
+const now=()=>new Date().toISOString();
+const sleep=(ms:number)=>new Promise(r=>setTimeout(r,ms));
+function extractText(d:any){if(typeof d?.output_text==="string")return d.output_text;return (d?.output||[]).flatMap((x:any)=>(x?.content||[]).filter((c:any)=>typeof c?.text==="string").map((c:any)=>c.text)).join("\n").trim();}
+function parseJson(s:string){try{return JSON.parse(s)}catch{const m=s.match(/\{[\s\S]*\}/);if(m)try{return JSON.parse(m[0])}catch{}return null}}
+function classify(status:number,network=false){return {retryable:network||status===408||status===409||status===429||status>=500,code:status===401||status===403?"INVALID_CREDENTIALS":status===429?"RATE_LIMITED":status>=500?"PROVIDER_TRANSIENT_ERROR":network?"NETWORK_ERROR":"INVALID_PROVIDER_REQUEST"}}
+async function openai(input:any,key:string,model:string,timeout=60000){const c=new AbortController();const t=setTimeout(()=>c.abort(),timeout);try{const r=await fetch("https://api.openai.com/v1/responses",{method:"POST",signal:c.signal,headers:{"Authorization":"Bearer "+key,"Content-Type":"application/json"},body:JSON.stringify({model,input})});const data=await r.json().catch(()=>({}));return {ok:r.ok,status:r.status,text:r.ok?extractText(data):"",data,network:false}}catch(e:any){return {ok:false,status:0,text:"",data:{error:{message:e?.name==="AbortError"?"Provider timeout":String(e?.message||"Network error")}},network:true}}finally{clearTimeout(t)}}
+async function gemini(input:string,key:string,model:string,timeout=60000){const c=new AbortController();const t=setTimeout(()=>c.abort(),timeout);try{const r=await fetch("https://generativelanguage.googleapis.com/v1beta/models/"+model+":generateContent?key="+encodeURIComponent(key),{method:"POST",signal:c.signal,headers:{"Content-Type":"application/json"},body:JSON.stringify({contents:[{role:"user",parts:[{text:input}]}]})});const data=await r.json().catch(()=>({}));const text=(data?.candidates?.[0]?.content?.parts||[]).map((p:any)=>p.text||"").join("").trim();return {ok:r.ok,status:r.status,text,data,network:false}}catch(e:any){return {ok:false,status:0,text:"",data:{error:{message:e?.name==="AbortError"?"Provider timeout":String(e?.message||"Network error")}},network:true}}finally{clearTimeout(t)}}
+async function provider(input:string,system:string,preferred:string|null){const open=Deno.env.get("OPENAI_API_KEY");const gem=Deno.env.get("GEMINI_API_KEY");const p=preferred||Deno.env.get("AI_PROVIDER")||"auto";const tries=p==="gemini"?["gemini","openai"]:p==="openai"?["openai","gemini"]:["gemini","openai"];for(const x of tries){if(x==="openai"&&open){const r=await openai([{role:"system",content:system},{role:"user",content:input}],open,Deno.env.get("OPENAI_MODEL")||"gpt-5.6-luna");if(r.ok)return {...r,provider:"openai",model:Deno.env.get("OPENAI_MODEL")||"gpt-5.6-luna"};if(!r.network&&r.status>=400&&r.status<500&&r.status!==429)continue}
+if(x==="gemini"&&gem){const r=await gemini(system+"\n\n"+input,gem,Deno.env.get("GEMINI_MODEL")||"gemini-2.5-flash-lite");if(r.ok)return {...r,provider:"gemini",model:Deno.env.get("GEMINI_MODEL")||"gemini-2.5-flash-lite"};}}
+return {ok:false,status:0,text:"",provider:null,model:null,data:{error:{message:"No configured AI provider is available."}},network:false}}
+async function audit(db:any,u:string,event:string,entity:string,id:string|null,details:any={}){await db.from("audit_events").insert({user_id:u,event_type:event,entity_type:entity,entity_id:id,details}).catch(()=>{})}
+function brief(prompt:string,brand:any){const p=prompt.toLowerCase();let platform=/tiktok/.test(p)?"tiktok":/instagram|reel/.test(p)?"instagram":/short/.test(p)?"youtube_shorts":/youtube/.test(p)?"youtube":"multi_platform";let format=/podcast/.test(p)?"podcast":/ad|advert/.test(p)?"ad":/short|reel|tiktok/.test(p)?"short_video":"video";return {topic:prompt,platform,audience:brand?.audience||"Define from brand context",objective:brand?.goals||"Create useful, engaging content",format,duration:format==="short_video"?"30-60s":"3-8m",tone:brand?.tone||"clear, confident, natural",language:brand?.preferred_language||"English",niche:brand?.description||"",audience_sophistication:"general",hook_strategy:"curiosity + immediate value",cta_strategy:(brand?.ctas||[])[0]||"follow for more"}}
+const pipelineSystem=`You are the AI Producer for Operator Creator. Build a professional content production package. Return ONLY valid JSON with keys: strategy, concepts, script, storyboard, quality. strategy must be a structured content brief. concepts must be an array of exactly 5 distinct concepts, each with title, angle, hook, rationale. script must have title, hook, body, payoff, cta, spoken_script. storyboard must be an array of scenes with scene_number,start_time,end_time,duration,narration,visual_description,camera_direction,on_screen_text,caption,transition,sound_effect,music_direction. quality must contain status,overall_score,factual_confidence,audio_quality,visual_relevance,platform_fit,issues,required_improvements,recommendations. Internal scores are production metrics only. Do not invent factual claims; mark uncertain claims. Favor natural spoken language, platform fit, brand consistency, and narrative-relevant visuals.`;
+async function runPipeline(db:any,user:any,prompt:string,workflowId:string,contentId:string|null,brand:any){const run=(await db.from("production_runs").insert({user_id:user.id,workflow_id:workflowId,content_id:contentId,status:"ideating",brief:brief(prompt,brand),current_stage:"ideation",max_attempts:2}).select("*").single()).data;if(!run)throw new Error("Production run could not be created");
+const started=Date.now();let r=await provider(JSON.stringify({brief:run.brief,brand,request:prompt}),pipelineSystem,null);
+if(!r.ok){await db.from("production_runs").update({status:"failed",current_stage:"ideation"}).eq("id",run.id).eq("user_id",user.id);return {production_run_id:run.id,status:"PROVIDER_NOT_CONFIGURED",message:r.data?.error?.message||"No configured AI provider is available."}}
+let pack=parseJson(r.text);if(!pack){await db.from("production_runs").update({status:"failed",current_stage:"ideation"}).eq("id",run.id);return {production_run_id:run.id,status:"FAILED",error:"AI returned malformed structured output"}}
+await db.from("production_stage_outputs").insert({user_id:user.id,production_run_id:run.id,stage:"ideation",output:{strategy:pack.strategy,concepts:pack.concepts},provider:r.provider,model:r.model,latency_ms:Date.now()-started,attempt:1});
+await db.from("production_stage_outputs").insert({user_id:user.id,production_run_id:run.id,stage:"writing",output:{script:pack.script},provider:r.provider,model:r.model,latency_ms:Date.now()-started,attempt:1});
+await db.from("production_stage_outputs").insert({user_id:user.id,production_run_id:run.id,stage:"storyboarding",output:{storyboard:pack.storyboard},provider:r.provider,model:r.model,latency_ms:Date.now()-started,attempt:1});
+let q=pack.quality||{};await db.from("quality_reviews").insert({user_id:user.id,production_run_id:run.id,component:"script",status:q.status==="PASS"&&Number(q.overall_score)>=85?"PASS":"FAIL",overall_score:q.overall_score,factual_confidence:q.factual_confidence,audio_quality:q.audio_quality,visual_relevance:q.visual_relevance,platform_fit:q.platform_fit,issues:q.issues||[],required_improvements:q.required_improvements||[],recommendations:q.recommendations||[]});
+if(q.status!=="PASS"||Number(q.overall_score)<85){await db.from("production_runs").update({status:"reworking",current_stage:"script_review",attempt_count:1}).eq("id",run.id).eq("user_id",user.id);const fix=await provider(JSON.stringify({original:pack,issues:q.issues,required_improvements:q.required_improvements}),pipelineSystem+"\nRewrite only the failed components. Preserve good components. Return the same JSON schema and improve the weak areas.",r.provider);if(fix.ok){const improved=parseJson(fix.text);if(improved){pack=improved;q=pack.quality||q;await db.from("production_stage_outputs").insert({user_id:user.id,production_run_id:run.id,stage:"rework",output:pack,provider:fix.provider,model:fix.model,latency_ms:0,attempt:2});await db.from("quality_reviews").insert({user_id:user.id,production_run_id:run.id,component:"script",status:q.status==="PASS"&&Number(q.overall_score)>=85?"PASS":"FAIL",overall_score:q.overall_score,factual_confidence:q.factual_confidence,audio_quality:q.audio_quality,visual_relevance:q.visual_relevance,platform_fit:q.platform_fit,issues:q.issues||[],required_improvements:q.required_improvements||[],recommendations:q.recommendations||[]});}}}
+const pass=q.status==="PASS"&&Number(q.overall_score)>=85;const finalStatus=pass?"ready":"failed";await db.from("production_runs").update({status:finalStatus,current_stage:pass?"ready":"script_review",attempt_count:pass?1:2}).eq("id",run.id).eq("user_id",user.id);
+if(contentId){await db.from("content_versions").insert({user_id:user.id,content_id:contentId,version_number:1,body:pack.script?.spoken_script||JSON.stringify(pack.script||{}),asset_ids:[]});await db.from("content").update({status:pass?"READY":"FAILED",metadata:{workflow_id:workflowId,production_run_id:run.id,quality:q,platform:run.brief.platform}}).eq("id",contentId).eq("user_id",user.id)}
+await audit(db,user.id,"production_completed","production_run",run.id,{status:finalStatus,quality:q,provider:r.provider});return {production_run_id:run.id,status:finalStatus,provider:r.provider,model:r.model,quality:q,brief:run.brief,script:pack.script,storyboard:pack.storyboard,concepts:pack.concepts}}
+Deno.serve(async(req)=>{if(req.method==="OPTIONS")return new Response("ok",{headers});const auth=req.headers.get("Authorization");if(!auth)return json({error:"UNAUTHORIZED_NO_AUTH_HEADER"},401);const url=Deno.env.get("SUPABASE_URL")!;const key=Deno.env.get("SUPABASE_ANON_KEY")||Deno.env.get("SUPABASE_PUBLISHABLE_KEY")||JSON.parse(Deno.env.get("SUPABASE_PUBLISHABLE_KEYS")||"{}").default;const db=createClient(url,key,{global:{headers:{Authorization:auth}}});const {data:{user},error}=await db.auth.getUser();if(error||!user)return json({error:"UNAUTHORIZED"},401);const body=await req.json().catch(()=>null);if(!body?.prompt&&!body?.task_id)return json({error:"prompt or task_id is required"},400);
+if(body.action==="production"){const prompt=String(body.prompt||"").trim();const workflow=(await db.from("workflows").insert({user_id:user.id,prompt,status:"QUEUED",metadata:{orchestrator:"ai-orchestrator",pipeline:true}}).select("*").single()).data;if(!workflow)return json({error:"Workflow creation failed"},500);let content=body.content_id?{id:body.content_id}:null;if(!content){content=(await db.from("content").insert({user_id:user.id,brand_id:body.brand_id||null,title:prompt.slice(0,120),content_type:"production_project",status:"QUEUED",platform:brief(prompt,body.brand_context).platform,prompt,metadata:{pipeline:true}}).select("id").single()).data}
+const result=await runPipeline(db,user,prompt,workflow.id,content?.id||null,body.brand_context||null);await db.from("workflows").update({status:result.status==="ready"?"COMPLETED":result.status==="PROVIDER_NOT_CONFIGURED"?"QUEUED":"FAILED",metadata:{pipeline:true,production_run_id:result.production_run_id}}).eq("id",workflow.id).eq("user_id",user.id);return json({workflow_id:workflow.id,content_id:content?.id||null,...result})}
+return json({error:"Use action=production for the production pipeline."},400)});
