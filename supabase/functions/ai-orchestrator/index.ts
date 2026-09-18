@@ -43,13 +43,13 @@ if(body.action==="generate_image"){
  const open=Deno.env.get("OPENAI_API_KEY"); if(!open)return json({status:"PROVIDER_NOT_CONFIGURED",message:"Image provider is not configured."},200);
  const c=new AbortController(); const t=setTimeout(()=>c.abort(),90000);
  try{
-  const rr=await fetch("https://api.openai.com/v1/images/generations",{method:"POST",signal:c.signal,headers:{"Authorization":"Bearer "+open,"Content-Type":"application/json"},body:JSON.stringify({model:Deno.env.get("OPENAI_IMAGE_MODEL")||"gpt-image-1",prompt,size:body.size||"1024x1024",quality:body.quality||"medium",output_format:"png"})});
+  const rr=await fetch("https://api.openai.com/v1/images/generations",{method:"POST",signal:c.signal,headers:{"Authorization":"Bearer "+open,"Content-Type":"application/json"},body:JSON.stringify({model:Deno.env.get("OPENAI_IMAGE_MODEL")||"gpt-image-2",prompt,size:body.size||"1024x1024",quality:body.quality||"medium",output_format:"png"})});
   const data=await rr.json().catch(()=>({})); if(!rr.ok)return json({status:"FAILED",provider:"openai",error:classify(rr.status,false).code},rr.status);
   const b64=data?.data?.[0]?.b64_json; if(!b64)return json({status:"FAILED",error:"Image provider returned no image data"},502);
   const bytes=Uint8Array.from(atob(b64),c=>c.charCodeAt(0)); const path=user.id+"/generated/"+crypto.randomUUID()+".png";
   const up=await db.storage.from("creator-assets").upload(path,bytes,{contentType:"image/png",upsert:false}); if(up.error)return json({status:"FAILED",error:"Asset storage failed"},500);
-  const asset=(await db.from("assets").insert({user_id:user.id,storage_path:path,asset_type:"image",mime_type:"image/png",file_size_bytes:bytes.byteLength,status:"READY",metadata:{provider:"openai",model:Deno.env.get("OPENAI_IMAGE_MODEL")||"gpt-image-1",prompt}}).select("*").single()).data;
-  await db.from("usage_events").insert({user_id:user.id,event_type:"image_generation",provider:"openai",metadata:{model:Deno.env.get("OPENAI_IMAGE_MODEL")||"gpt-image-1",asset_id:asset?.id}}).catch(()=>{});
+  const asset=(await db.from("assets").insert({user_id:user.id,storage_path:path,asset_type:"image",mime_type:"image/png",file_size_bytes:bytes.byteLength,status:"READY",metadata:{provider:"openai",model:Deno.env.get("OPENAI_IMAGE_MODEL")||"gpt-image-2",prompt}}).select("*").single()).data;
+  await db.from("usage_events").insert({user_id:user.id,event_type:"image_generation",provider:"openai",metadata:{model:Deno.env.get("OPENAI_IMAGE_MODEL")||"gpt-image-2",asset_id:asset?.id}}).catch(()=>{});
   return json({status:"COMPLETED",asset});
  }catch(e:any){return json({status:"FAILED",error:e?.name==="AbortError"?"IMAGE_PROVIDER_TIMEOUT":"IMAGE_PROVIDER_ERROR"},502)}finally{clearTimeout(t)}
 }
