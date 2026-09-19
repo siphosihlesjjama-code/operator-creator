@@ -93,8 +93,19 @@ Deno.serve(async(req)=>{
    if(!media.ok){await failLedger("RENDER_OUTPUT_DOWNLOAD_FAILED");return json({error:"RENDER_OUTPUT_DOWNLOAD_FAILED"},502);}
    const bytes=new Uint8Array(await media.arrayBuffer());
    const contentType=String(media.headers.get("content-type")||"video/mp4").split(";")[0].toLowerCase();
-   if(bytes.byteLength===0||bytes.byteLength>250*1024*1024||contentType!=="video/mp4"){
+   const magicOk=bytes.byteLength>=12 && String.fromCharCode(...bytes.slice(4,8))==="ftyp";
+   const jobAspect=String(job.aspect_ratio||"16:9");
+   const expectedHeight=String(job.resolution||"1080p")==="720p"?720:String(job.resolution||"1080p")==="1080p"?1080:String(job.resolution||"1080p")==="1440p"?1440:String(job.resolution||"1080p")==="2160p"?2160:null;
+   const actualWidth=Number(video.width), actualHeight=Number(video.height);
+   const actualDuration=Number(video.duration);
+   const actualAspect=actualHeight>0?actualWidth/actualHeight:0;
+   const expectedAspect=jobAspect==="9:16"?9/16:jobAspect==="1:1"?1:jobAspect==="4:5"?4/5:16/9;
+   const aspectOk=actualAspect>0 && Math.abs(actualAspect-expectedAspect)<0.02;
+   if(bytes.byteLength===0||bytes.byteLength>250*1024*1024||contentType!=="video/mp4"||!magicOk){
      await failLedger("RENDER_OUTPUT_INVALID");return json({error:"RENDER_OUTPUT_INVALID"},502);
+   }
+   if(expectedHeight && actualHeight!==expectedHeight || !aspectOk || actualDuration<=0){
+     await failLedger("FINAL_MEDIA_EXPECTATION_MISMATCH");return json({error:"FINAL_MEDIA_EXPECTATION_MISMATCH"},422);
    }
 
    const path=job.user_id+"/production/"+job.production_run_id+"/final-"+job.id+".mp4";
