@@ -208,8 +208,12 @@ if(body.action==="validate_render"){
  const cueTiming=normalizedCues.length>0&&normalizedCues.every((x:any)=>Number.isFinite(x.start)&&Number.isFinite(x.end)&&x.start>=0&&x.end>x.start&&x.end<=duration+0.25&&x.text.length>0);
  const cueOrder=normalizedCues.every((x:any,i:number)=>i===0||x.start>=normalizedCues[i-1].start);
  const cueOverlap=normalizedCues.some((x:any,i:number)=>i>0&&x.start<normalizedCues[i-1].end-0.01);
- checks.push({check:"captions_valid",passed:!!cap&&cap.status==="READY"&&cueTiming&&cueOrder&&!cueOverlap});
+ const cueDuplicates=normalizedCues.some((x:any,i:number)=>i>0&&x.start===normalizedCues[i-1].start&&x.end===normalizedCues[i-1].end&&x.text===normalizedCues[i-1].text);
+ const cueCoverage=normalizedCues.length>0&&normalizedCues[0].start>=0&&normalizedCues[normalizedCues.length-1].end<=duration+0.25;
+ checks.push({check:"captions_valid",passed:!!cap&&cap.status==="READY"&&cueTiming&&cueOrder&&!cueOverlap&&!cueDuplicates&&cueCoverage});
  checks.push({check:"caption_cues_non_overlapping",passed:!!cap&&cueTiming&&!cueOverlap});
+ checks.push({check:"caption_cues_not_duplicated",passed:!!cap&&cueTiming&&!cueDuplicates});
+ checks.push({check:"caption_timing_coverage_valid",passed:!!cap&&cueCoverage});
  const {data:links}=await db.from("production_media_links").select("scene_number,asset_id").eq("production_run_id",runId).eq("user_id",user.id).eq("role","scene_visual");
  const {data:readyAssets}=links?.length?await db.from("assets").select("id,status,metadata").eq("user_id",user.id).in("id",links.map((x:any)=>x.asset_id)):({data:[]});
  const readySet=new Set((readyAssets||[]).filter((a:any)=>a.status==="READY"&&String(a.metadata?.production_run_id||"")===runId).map((a:any)=>a.id));
