@@ -70,6 +70,10 @@ Deno.serve(async(req)=>{
      await failLedger(message); return json({status:"FAILED",render_job_id:job.id},200);
    }
    if(mapped!=="COMPLETED"){
+     if(["FAILED","CANCELLED"].includes(String(job.status||""))){
+       await failLedger("STALE_WEBHOOK_FOR_TERMINAL_JOB");
+       return json({status:job.status,render_job_id:job.id,ignored:true},200);
+     }
      await db.from("render_jobs").update({status:mapped,provider_status:String(resp.status||event.status||"processing"),started_at:job.started_at||now()}).eq("id",job.id);
      await db.from("production_runs").update({render_status:mapped,current_stage:"assembly"}).eq("id",job.production_run_id);
      await db.from("render_webhook_events").update({payload:event}).eq("id",ledger.id);
