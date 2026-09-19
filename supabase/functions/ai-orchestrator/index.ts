@@ -60,7 +60,7 @@ if(body.action==="generate_scene_images"){
    const up=await db.storage.from("creator-assets").upload(path,bytes,{contentType:"image/png",upsert:false}); if(up.error){results.push({scene_number:sceneNo,status:"FAILED",error:"ASSET_STORAGE_FAILED"});continue}
    const ins=await db.from("assets").insert({user_id:user.id,storage_path:path,asset_type:"image",mime_type:"image/png",file_size_bytes:bytes.byteLength,status:"READY",metadata:{production_run_id:runId,scene_number:sceneNo,source:"storyboard_scene"}}).select("id,storage_path,asset_type,mime_type,file_size_bytes").single();
    if(ins.error){results.push({scene_number:sceneNo,status:"FAILED",error:"ASSET_RECORD_FAILED"});continue}
-   results.push({scene_number:sceneNo,status:"COMPLETED",asset:ins.data});
+   results.push({scene_number:sceneNo,status:"COMPLETED",asset:ins.data}); await db.from("production_media_links").insert({user_id:user.id,production_run_id:runId,scene_number:sceneNo,asset_id:ins.data.id,role:"scene_visual"});
   }catch(e){results.push({scene_number:sceneNo,status:"FAILED",error:e?.name==="AbortError"?"TIMEOUT":"NETWORK_ERROR"});}
   finally{clearTimeout(timer)}
  }
