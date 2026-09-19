@@ -89,6 +89,18 @@ if(body.action==="generate_captions"){
  await audit(db,user.id,"captions_generated","production_run",runId,{caption_track_id:ins.data.id,cue_count:cues.length});
  return json({status:"COMPLETED",production_run_id:runId,caption_track_id:ins.data.id,render_job:render.data||null,cues});
 }
+if(body.action==="generate_voice"){
+ const runId=String(body.production_run_id||"").trim(); const sourceAssetId=String(body.source_asset_id||"").trim();
+ if(!runId||!sourceAssetId)return json({error:"production_run_id and source_asset_id are required"},400);
+ const {data:run}=await db.from("production_runs").select("*").eq("id",runId).eq("user_id",user.id).maybeSingle();
+ if(!run)return json({error:"Production run not found"},404);
+ const {data:consent}=await db.from("voice_consents").select("id,consent_type,granted_at,revoked_at").eq("user_id",user.id).eq("asset_id",sourceAssetId).is("revoked_at",null).order("granted_at",{ascending:false}).limit(1).maybeSingle();
+ if(!consent)return json({status:"VOICE_CONSENT_REQUIRED",message:"An active voice consent record is required before voice generation."},403);
+ const providerName=Deno.env.get("VOICE_PROVIDER")||"";
+ if(!providerName)return json({status:"PROVIDER_NOT_CONFIGURED",message:"Voice provider is not configured. Consent was verified, but no voice provider was called."},200);
+ await db.from("production_stage_outputs").insert({user_id:user.id,production_run_id:runId,stage:"voice_generation",output:{status:"PROVIDER_NOT_CONFIGURED",consent_id:consent.id},provider:providerName,attempt:1,status:"BLOCKED"});
+ return json({status:"PROVIDER_NOT_CONFIGURED",message:"Voice provider adapter is not configured yet.",consent_verified:true},200);
+}
 if(body.action==="generate_image"){
  const prompt=String(body.prompt||"").trim(); if(!prompt)return json({error:"prompt is required"},400);
  const open=Deno.env.get("OPENAI_API_KEY"); if(!open)return json({status:"PROVIDER_NOT_CONFIGURED",message:"Image provider is not configured."},200);
