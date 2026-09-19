@@ -70,6 +70,31 @@ if(body.action==="generate_scene_images"){
  await audit(db,user.id,"scene_media_generated","production_run",runId,{completed,total:results.length});
  return json({status:completed===results.length?"COMPLETED":"PARTIAL",production_run_id:runId,scene_results:results},200);
 }
+if(body.action==="validate_render"){
+ const runId=String(body.production_run_id||"").trim();
+ if(!runId)return json({error:"production_run_id is required"},400);
+ const {data:run}=await db.from("production_runs").select("*").eq("id",runId).eq("user_id",user.id).maybeSingle();
+ if(!run)return json({error:"Production run not found"},404);
+ const checks:any[]=[];
+ const {data:render}=await db.from("render_jobs").select("*").eq("production_run_id",runId).eq("user_id",user.id).order("created_at",{ascending:false}).limit(1).maybeSingle();
+ checks.push({check:"render_job_exists",passed:!!render});
+ checks.push({check:"render_completed",passed:render?.status==="COMPLETED"});
+ const finalId=render?.asset_id||run.final_asset_id||null;
+ let asset:any=null;
+ if(finalId){asset=(await db.from("assets").select("id,user_id,storage_path,mime_type,file_size_bytes,status,metadata").eq("id",finalId).eq("user_id",user.id).maybeSingle()).data}
+ checks.push({check:"final_asset_exists",passed:!!asset});
+ checks.push({check:"final_asset_ready",passed:asset?.status==="READY"});
+ checks.push({check:"final_asset_belongs_to_run",passed:!!asset&&String(asset.metadata?.production_run_id||"")===runId});
+ const {data:cap}=await db.from("caption_tracks").select("id,status,cues").eq("production_run_id",runId).eq("user_id",user.id).order("created_at",{ascending:false}).limit(1).maybeSingle();
+ const cues=Array.isArray(cap?.cues)?cap.cues:[];
+ const timing=cues.every((x:any)=>Number.isFinite(Number(x.start))&&Number.isFinite(Number(x.end))&&Number(x.start)>=0&&Number(x.end)>Number(x.start));
+ checks.push({check:"captions_valid",passed:!!cap&&cap.status==="READY"&&timing});
+ const all=checks.every(x=>x.passed);
+ await db.from("quality_reviews").insert({user_id:user.id,production_run_id:runId,component:"final_media",status:all?"PASSED":"FAILED",overall_score:all?100:0,factual_confidence:null,audio_quality:null,visual_relevance:null,platform_fit:null,issues:checks.filter(x=>!x.passed),required_improvements:checks.filter(x=>!x.passed),recommendations:all?["Final media passed structural QA."]:["Resolve failed media QA checks before publishing."]});
+ await db.from("production_runs").update({status:all?"ready":"failed",current_stage:all?"approval":"final_qa",render_status:all?"COMPLETED":"FAILED",final_asset_id:all?finalId:null}).eq("id",runId).eq("user_id",user.id);
+ await audit(db,user.id,all?"final_media_qa_passed":"final_media_qa_failed","production_run",runId,{checks});
+ return json({status:all?"PASSED":"FAILED",production_run_id:runId,checks},200);
+}
 if(body.action==="generate_captions"){
  const runId=String(body.production_run_id||"").trim();
  if(!runId)return json({error:"production_run_id is required"},400);
