@@ -361,6 +361,52 @@ if(body.action==="generate_audio"){
  if(!provider)return json({status:"PROVIDER_NOT_CONFIGURED",message:"Audio/music provider is not configured."},200);
  return json({status:"PROVIDER_NOT_CONFIGURED",message:"Audio provider adapter is not implemented yet; no audio was fabricated."},200);
 }
+if(body.action==="validate_publish"){
+ const contentId=String(body.content_id||"").trim(); const runId=body.production_run_id?String(body.production_run_id).trim():null; const platform=String(body.platform||"").trim().toLowerCase();
+ if(!contentId||!platform)return json({error:"content_id and platform are required"},400);
+ const validation=await validatePlatformForPublishing(db,user.id,contentId,platform,runId);
+ return json({status:validation.valid?"VALID":"BLOCKED",platform,errors:validation.errors},validation.valid?200:409);
+}
+if(body.action==="publish"){
+ const contentId=String(body.content_id||"").trim(); const runId=body.production_run_id?String(body.production_run_id).trim():null; const platform=String(body.platform||"").trim().toLowerCase();
+ if(!contentId||!platform)return json({error:"content_id and platform are required"},400);
+ const validation=await validatePlatformForPublishing(db,user.id,contentId,platform,runId);
+ if(!validation.valid)return json({status:"BLOCKED",errors:validation.errors},409);
+ const idempotencyKey=String(body.idempotency_key||("publish:"+user.id+":"+contentId+":"+platform+":"+(runId||"none"))).slice(0,240);
+ const existing=(await db.from("publishing_attempts").select("*").eq("user_id",user.id).eq("idempotency_key",idempotencyKey).maybeSingle()).data;
+ if(existing){
+   if(existing.status==="PUBLISHED")return json({status:"PUBLISHED",publishing_attempt_id:existing.id,external_post_id:existing.external_post_id},200);
+   if(existing.status==="PROCESSING"||existing.status==="QUEUED")return json({status:existing.status,publishing_attempt_id:existing.id},202);
+   if(existing.status==="CANCELLED")return json({status:"CANCELLED",publishing_attempt_id:existing.id},409);
+ }
+ let attempt=existing;
+ if(!attempt){
+   const ins=await db.from("publishing_attempts").insert({user_id:user.id,production_run_id:runId,content_id:contentId,platform,idempotency_key:idempotencyKey,status:"QUEUED"}).select("*").single();
+   if(ins.error){
+     const race=(await db.from("publishing_attempts").select("*").eq("user_id",user.id).eq("idempotency_key",idempotencyKey).maybeSingle()).data;
+     if(race)return json({status:race.status,publishing_attempt_id:race.id,external_post_id:race.external_post_id||null},200);
+     return json({status:"FAILED",error_code:"PUBLISH_ATTEMPT_CREATE_FAILED"},500);
+   }
+   attempt=ins.data;
+ }
+ const publisher=Deno.env.get("PUBLISH_PROVIDER")||"";
+ if(!publisher){
+   await db.from("publishing_attempts").update({status:"PROVIDER_NOT_CONFIGURED",error_code:"PUBLISH_PROVIDER_NOT_CONFIGURED",error_message:"No publishing provider is configured."}).eq("id",attempt.id).eq("user_id",user.id);
+   return json({status:"PROVIDER_NOT_CONFIGURED",publishing_attempt_id:attempt.id,message:"Publishing provider is not configured; nothing was published."},200);
+ }
+ await db.from("publishing_attempts").update({status:"PROCESSING",attempt_number:Number(attempt.attempt_number||1)}).eq("id",attempt.id).eq("user_id",user.id);
+ await audit(db,user.id,"publishing_provider_unavailable","publishing_attempt",attempt.id,{platform,publisher});
+ await db.from("publishing_attempts").update({status:"FAILED",error_code:"PUBLISHER_ADAPTER_NOT_IMPLEMENTED",error_message:"The configured publisher adapter is not implemented. No external publish call was made."}).eq("id",attempt.id).eq("user_id",user.id);
+ return json({status:"FAILED",publishing_attempt_id:attempt.id,error_code:"PUBLISHER_ADAPTER_NOT_IMPLEMENTED"},200);
+}
+if(body.action==="cancel_publish"){
+ const attemptId=String(body.publishing_attempt_id||"").trim(); if(!attemptId)return json({error:"publishing_attempt_id is required"},400);
+ const {data:attempt}=await db.from("publishing_attempts").select("*").eq("id",attemptId).eq("user_id",user.id).maybeSingle();
+ if(!attempt)return json({error:"Publishing attempt not found"},404);
+ if(["PUBLISHED","CANCELLED"].includes(attempt.status))return json({status:attempt.status,publishing_attempt_id:attempt.id},409);
+ await db.from("publishing_attempts").update({status:"CANCELLED",error_code:"CANCELLED_BY_USER",error_message:"Publishing operation cancelled before external completion."}).eq("id",attempt.id).eq("user_id",user.id);
+ return json({status:"CANCELLED",publishing_attempt_id:attempt.id},200);
+}
 if(body.action==="production"){const prompt=String(body.prompt||"").trim();const workflow=(await db.from("workflows").insert({user_id:user.id,prompt,status:"QUEUED",metadata:{orchestrator:"ai-orchestrator",pipeline:true}}).select("*").single()).data;if(!workflow)return json({error:"Workflow creation failed"},500);let content=body.content_id?{id:body.content_id}:null;if(!content){content=(await db.from("content").insert({user_id:user.id,brand_id:body.brand_id||null,title:prompt.slice(0,120),content_type:"production_project",status:"QUEUED",platform:brief(prompt,body.brand_context).platform,prompt,metadata:{pipeline:true}}).select("id").single()).data}
 const result=await runPipeline(db,user,prompt,workflow.id,content?.id||null,body.brand_context||null);await db.from("workflows").update({status:result.status==="ready"?"COMPLETED":result.status==="PROVIDER_NOT_CONFIGURED"?"QUEUED":"FAILED",metadata:{pipeline:true,production_run_id:result.production_run_id}}).eq("id",workflow.id).eq("user_id",user.id);return json({workflow_id:workflow.id,content_id:content?.id||null,...result})}
 return json({error:"Use action=production for the production pipeline."},400)});
