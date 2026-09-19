@@ -7,6 +7,32 @@ const now=()=>new Date().toISOString();
 const sleep=(ms:number)=>new Promise(r=>setTimeout(r,ms));
 function extractText(d:any){if(typeof d?.output_text==="string")return d.output_text;return (d?.output||[]).flatMap((x:any)=>(x?.content||[]).filter((c:any)=>typeof c?.text==="string").map((c:any)=>c.text)).join("\n").trim();}
 function parseJson(s:string){try{return JSON.parse(s)}catch{const m=s.match(/\{[\s\S]*\}/);if(m)try{return JSON.parse(m[0])}catch{}return null}}
+function validatePack(pack:any){
+ const issues:string[]=[];
+ const concepts=Array.isArray(pack?.concepts)?pack.concepts:[];
+ if(concepts.length!==5)issues.push("CONCEPT_COUNT_MUST_BE_5");
+ const conceptKeys=concepts.map((x:any)=>String(x?.title||"").trim().toLowerCase()).filter(Boolean);
+ if(conceptKeys.length!==new Set(conceptKeys).size)issues.push("DUPLICATE_CONCEPT_TITLES");
+ const hookKeys=concepts.map((x:any)=>String(x?.hook||"").trim().toLowerCase()).filter(Boolean);
+ if(hookKeys.length!==new Set(hookKeys).size)issues.push("DUPLICATE_CONCEPT_HOOKS");
+ if(concepts.some((x:any)=>!String(x?.title||"").trim()||!String(x?.angle||"").trim()||!String(x?.hook||"").trim()))issues.push("CONCEPT_FIELDS_INCOMPLETE");
+ const spoken=String(pack?.script?.spoken_script||"").trim();
+ if(spoken.length<80)issues.push("SCRIPT_TOO_SHORT");
+ if(!String(pack?.script?.hook||"").trim())issues.push("SCRIPT_HOOK_MISSING");
+ if(!String(pack?.script?.cta||"").trim())issues.push("SCRIPT_CTA_MISSING");
+ const scenes=Array.isArray(pack?.storyboard)?pack.storyboard:[];
+ if(!scenes.length)issues.push("STORYBOARD_EMPTY");
+ let previousEnd=-Infinity;
+ for(const scene of scenes){
+   const start=Number(scene?.start_time),end=Number(scene?.end_time),duration=Number(scene?.duration);
+   if(!Number.isFinite(start)||!Number.isFinite(end)||end<=start||!Number.isFinite(duration)||duration<=0)issues.push("STORYBOARD_TIMING_INVALID");
+   if(Number.isFinite(start)&&start<previousEnd)issues.push("STORYBOARD_SCENES_OVERLAP");
+   if(Number.isFinite(end))previousEnd=Math.max(previousEnd,end);
+   if(!String(scene?.visual_description||"").trim())issues.push("STORYBOARD_VISUAL_MISSING");
+   if(!String(scene?.narration||"").trim())issues.push("STORYBOARD_NARRATION_MISSING");
+ }
+ return [...new Set(issues)];
+}
 function classify(status:number,network=false){return {retryable:network||status===408||status===409||status===429||status>=500,code:status===401||status===403?"INVALID_CREDENTIALS":status===429?"RATE_LIMITED":status>=500?"PROVIDER_TRANSIENT_ERROR":network?"NETWORK_ERROR":"INVALID_PROVIDER_REQUEST"}}
 async function openai(input:any,key:string,model:string,timeout=60000){const c=new AbortController();const t=setTimeout(()=>c.abort(),timeout);try{const r=await fetch("https://api.openai.com/v1/responses",{method:"POST",signal:c.signal,headers:{"Authorization":"Bearer "+key,"Content-Type":"application/json"},body:JSON.stringify({model,input})});const data=await r.json().catch(()=>({}));return {ok:r.ok,status:r.status,text:r.ok?extractText(data):"",data,network:false}}catch(e:any){return {ok:false,status:0,text:"",data:{error:{message:e?.name==="AbortError"?"Provider timeout":String(e?.message||"Network error")}},network:true}}finally{clearTimeout(t)}}
 async function gemini(input:string,key:string,model:string,timeout=60000){const c=new AbortController();const t=setTimeout(()=>c.abort(),timeout);try{const r=await fetch("https://generativelanguage.googleapis.com/v1beta/models/"+model+":generateContent?key="+encodeURIComponent(key),{method:"POST",signal:c.signal,headers:{"Content-Type":"application/json"},body:JSON.stringify({contents:[{role:"user",parts:[{text:input}]}]})});const data=await r.json().catch(()=>({}));const text=(data?.candidates?.[0]?.content?.parts||[]).map((p:any)=>p.text||"").join("").trim();return {ok:r.ok,status:r.status,text,data,network:false}}catch(e:any){return {ok:false,status:0,text:"",data:{error:{message:e?.name==="AbortError"?"Provider timeout":String(e?.message||"Network error")}},network:true}}finally{clearTimeout(t)}}
@@ -28,11 +54,19 @@ await db.from("production_runs").update({status:"ideating",current_stage:"ideati
 let r=await provider(JSON.stringify({brief:run.brief,brand,request:prompt,research_notes:research.ok?parseJson(research.text):null,prior_memory:prior}),pipelineSystem,null);
 if(!r.ok){await db.from("production_runs").update({status:"failed",current_stage:"ideation"}).eq("id",run.id).eq("user_id",user.id);return {production_run_id:run.id,status:"PROVIDER_NOT_CONFIGURED",message:r.data?.error?.message||"No configured AI provider is available."}}
 let pack=parseJson(r.text);if(!pack){await db.from("production_runs").update({status:"failed",current_stage:"ideation"}).eq("id",run.id);return {production_run_id:run.id,status:"FAILED",error:"AI returned malformed structured output"}}
-await db.from("production_stage_outputs").insert({user_id:user.id,production_run_id:run.id,stage:"ideation",output:{strategy:pack.strategy,concepts:pack.concepts},provider:r.provider,model:r.model,latency_ms:Date.now()-started,attempt:1});
+const structuralIssues=validatePack(pack);
+if(structuralIssues.length){
+ pack.quality=pack.quality||{};
+ pack.quality.status="FAIL";
+ pack.quality.overall_score=Math.min(Number(pack.quality.overall_score)||0,84);
+ pack.quality.issues=[...(Array.isArray(pack.quality.issues)?pack.quality.issues:[]),...structuralIssues];
+ pack.quality.required_improvements=[...(Array.isArray(pack.quality.required_improvements)?pack.quality.required_improvements:[]),...structuralIssues];
+}
+await db.from("production_stage_outputs").insert({user_id:user.id,production_run_id:run.id,stage:"ideation",output:{strategy:pack.strategy,concepts:pack.concepts,validation:{structural_issues:structuralIssues}},provider:r.provider,model:r.model,latency_ms:Date.now()-started,attempt:1});
 await db.from("production_stage_outputs").insert({user_id:user.id,production_run_id:run.id,stage:"writing",output:{script:pack.script},provider:r.provider,model:r.model,latency_ms:Date.now()-started,attempt:1});
 await db.from("production_stage_outputs").insert({user_id:user.id,production_run_id:run.id,stage:"storyboarding",output:{storyboard:pack.storyboard},provider:r.provider,model:r.model,latency_ms:Date.now()-started,attempt:1});
 let q=pack.quality||{};await db.from("quality_reviews").insert({user_id:user.id,production_run_id:run.id,component:"script",status:q.status==="PASS"&&Number(q.overall_score)>=85?"PASS":"FAIL",overall_score:q.overall_score,factual_confidence:q.factual_confidence,audio_quality:q.audio_quality,visual_relevance:q.visual_relevance,platform_fit:q.platform_fit,issues:q.issues||[],required_improvements:q.required_improvements||[],recommendations:q.recommendations||[]});
-if(q.status!=="PASS"||Number(q.overall_score)<85){await db.from("production_runs").update({status:"reworking",current_stage:"script_review",attempt_count:1}).eq("id",run.id).eq("user_id",user.id);const fix=await provider(JSON.stringify({original:pack,issues:q.issues,required_improvements:q.required_improvements}),pipelineSystem+"\nRewrite only the failed components. Preserve good components. Return the same JSON schema and improve the weak areas.",r.provider);if(fix.ok){const improved=parseJson(fix.text);if(improved){pack=improved;q=pack.quality||q;await db.from("production_stage_outputs").insert({user_id:user.id,production_run_id:run.id,stage:"rework",output:pack,provider:fix.provider,model:fix.model,latency_ms:0,attempt:2});await db.from("quality_reviews").insert({user_id:user.id,production_run_id:run.id,component:"script",status:q.status==="PASS"&&Number(q.overall_score)>=85?"PASS":"FAIL",overall_score:q.overall_score,factual_confidence:q.factual_confidence,audio_quality:q.audio_quality,visual_relevance:q.visual_relevance,platform_fit:q.platform_fit,issues:q.issues||[],required_improvements:q.required_improvements||[],recommendations:q.recommendations||[]});}}}
+if(q.status!=="PASS"||Number(q.overall_score)<85){await db.from("production_runs").update({status:"reworking",current_stage:"script_review",attempt_count:1}).eq("id",run.id).eq("user_id",user.id);const fix=await provider(JSON.stringify({original:pack,issues:q.issues,required_improvements:q.required_improvements}),pipelineSystem+"\nRewrite only the failed components. Preserve good components. Return the same JSON schema and improve the weak areas.",r.provider);if(fix.ok){const improved=parseJson(fix.text);if(improved){pack=improved;q=pack.quality||q;const reworkIssues=validatePack(pack);if(reworkIssues.length){q.status="FAIL";q.overall_score=Math.min(Number(q.overall_score)||0,84);q.issues=[...(Array.isArray(q.issues)?q.issues:[]),...reworkIssues];q.required_improvements=[...(Array.isArray(q.required_improvements)?q.required_improvements:[]),...reworkIssues];}await db.from("production_stage_outputs").insert({user_id:user.id,production_run_id:run.id,stage:"rework",output:{...pack,validation:{structural_issues:reworkIssues}},provider:fix.provider,model:fix.model,latency_ms:0,attempt:2});await db.from("quality_reviews").insert({user_id:user.id,production_run_id:run.id,component:"script",status:q.status==="PASS"&&Number(q.overall_score)>=85?"PASS":"FAIL",overall_score:q.overall_score,factual_confidence:q.factual_confidence,audio_quality:q.audio_quality,visual_relevance:q.visual_relevance,platform_fit:q.platform_fit,issues:q.issues||[],required_improvements:q.required_improvements||[],recommendations:q.recommendations||[]});}}}
 const pass=q.status==="PASS"&&Number(q.overall_score)>=85;const finalStatus=pass?"ready":"failed";await db.from("production_runs").update({status:finalStatus,current_stage:pass?"ready":"script_review",attempt_count:pass?1:2}).eq("id",run.id).eq("user_id",user.id);
 if(contentId){await db.from("content_versions").insert({user_id:user.id,content_id:contentId,version_number:1,body:pack.script?.spoken_script||JSON.stringify(pack.script||{}),asset_ids:[]});await db.from("content").update({status:pass?"READY":"FAILED",metadata:{workflow_id:workflowId,production_run_id:run.id,quality:q,platform:run.brief.platform}}).eq("id",contentId).eq("user_id",user.id)}
 await db.from("content_memory").insert({user_id:user.id,content_id:contentId,production_run_id:run.id,memory_type:"production",topic:prompt,fingerprint,data:{brief:run.brief,concepts:pack.concepts,quality:q,platform:run.brief.platform,status:finalStatus}}).catch(()=>{});
