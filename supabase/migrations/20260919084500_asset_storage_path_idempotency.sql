@@ -1,0 +1,1 @@
+create unique index if not exists assets_user_storage_path_unique on public.assets(user_id,storage_path);
