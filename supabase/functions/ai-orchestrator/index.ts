@@ -233,7 +233,8 @@ if(body.action==="queue_render"){
  if(existing){
    if(existing.status==="COMPLETED")return json({status:"COMPLETED",render_job_id:existing.id,render_status:"COMPLETED"},200);
    if(existing.provider_job_id)return json({status:existing.status,render_job_id:existing.id,provider_job_id:existing.provider_job_id},200);
-   if(existing.status==="PROCESSING"||existing.status==="QUEUED")return json({status:existing.status,render_job_id:existing.id},200);
+   if(existing.status==="PROCESSING")return json({status:"PROCESSING",render_job_id:existing.id},200);
+   if(existing.status==="QUEUED"&&existing.next_retry_at&&new Date(existing.next_retry_at).getTime()>Date.now())return json({status:"QUEUED",render_job_id:existing.id,next_retry_at:existing.next_retry_at},202);
  }
  let job=existing;
  if(!job){
@@ -265,7 +266,7 @@ if(body.action==="queue_render"){
  const callbackBase=Deno.env.get("PUBLIC_FUNCTION_BASE_URL")||"https://fvjieqombgolkxvbjwsk.supabase.co/functions/v1";
  const payload:any={timeline,output:{format:"mp4",size:dims,fps:30,thumbnail:{capture:1}}};
  if(callbackBase)payload.callback=callbackBase.replace(/\/$/,"")+"/render-webhook";
- const submitted=await shotstackRequest(cfg.base+"/render",cfg.apiKey,{method:"POST",body:JSON.stringify(payload)});
+ await db.from("render_jobs").update({status:"PROCESSING",started_at:now(),provider_status:"submitting",last_error:null}).eq("id",job.id).eq("user_id",user.id);\n const submitted=await shotstackRequest(cfg.base+"/render",cfg.apiKey,{method:"POST",body:JSON.stringify(payload)});
  if(!submitted.ok){
    const ambiguous=submitted.network||submitted.status>=500;
    const retryable=!ambiguous&&(submitted.status===408||submitted.status===409||submitted.status===429);
