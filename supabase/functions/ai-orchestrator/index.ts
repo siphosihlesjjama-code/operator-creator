@@ -70,6 +70,25 @@ if(body.action==="generate_scene_images"){
  await audit(db,user.id,"scene_media_generated","production_run",runId,{completed,total:results.length});
  return json({status:completed===results.length?"COMPLETED":"PARTIAL",production_run_id:runId,scene_results:results},200);
 }
+if(body.action==="generate_captions"){
+ const runId=String(body.production_run_id||"").trim();
+ if(!runId)return json({error:"production_run_id is required"},400);
+ const {data:run}=await db.from("production_runs").select("*").eq("id",runId).eq("user_id",user.id).maybeSingle();
+ if(!run)return json({error:"Production run not found"},404);
+ const {data:scriptStage}=await db.from("production_stage_outputs").select("output").eq("production_run_id",runId).eq("user_id",user.id).eq("stage","writing").order("created_at",{ascending:false}).limit(1).maybeSingle();
+ const script=String(scriptStage?.output?.script?.spoken_script||"").trim();
+ if(!script)return json({error:"No spoken script available"},409);
+ const words=script.split(/\s+/).filter(Boolean); const duration=Math.max(1,Number(run.brief?.duration_seconds||run.brief?.duration||60));
+ const chunk=Math.max(1,Math.ceil(words.length/Math.max(1,Math.ceil(duration/3))));
+ const cues:any[]=[]; for(let i=0;i<words.length;i+=chunk){const part=words.slice(i,i+chunk);const start=Math.min(duration-0.1,(i/words.length)*duration);const end=Math.min(duration,(Math.min(words.length,i+chunk)/words.length)*duration);cues.push({start:Math.round(start*100)/100,end:Math.round(Math.max(start+0.2,end)*100)/100,text:part.join(" ")});}
+ const ins=await db.from("caption_tracks").insert({user_id:user.id,production_run_id:runId,content_id:run.content_id,language:run.brief?.language==="English"?"en":"en",format:"webvtt",status:"READY",cues,source:"script_deterministic_v1"}).select("id").single();
+ if(ins.error)return json({status:"FAILED",error:"CAPTION_PERSIST_FAILED"},500);
+ await db.from("production_runs").update({caption_track_id:ins.data.id,render_status:"QUEUED",current_stage:"assembly"}).eq("id",runId).eq("user_id",user.id);
+ const render=await db.from("render_jobs").insert({user_id:user.id,production_run_id:runId,status:"QUEUED",format:body.format||"mp4",aspect_ratio:body.aspect_ratio||"16:9",resolution:body.resolution||"1080p",caption_track_id:ins.data.id,provider:"assembly_pending",metadata:{reason:"No configured video renderer/provider yet"}}).select("id,status").single();
+ await db.from("production_stage_outputs").insert({user_id:user.id,production_run_id:runId,stage:"captions",output:{caption_track_id:ins.data.id,cue_count:cues.length},provider:"operator_creator",model:"deterministic_caption_v1",attempt:1,status:"COMPLETED"});
+ await audit(db,user.id,"captions_generated","production_run",runId,{caption_track_id:ins.data.id,cue_count:cues.length});
+ return json({status:"COMPLETED",production_run_id:runId,caption_track_id:ins.data.id,render_job:render.data||null,cues});
+}
 if(body.action==="generate_image"){
  const prompt=String(body.prompt||"").trim(); if(!prompt)return json({error:"prompt is required"},400);
  const open=Deno.env.get("OPENAI_API_KEY"); if(!open)return json({status:"PROVIDER_NOT_CONFIGURED",message:"Image provider is not configured."},200);
