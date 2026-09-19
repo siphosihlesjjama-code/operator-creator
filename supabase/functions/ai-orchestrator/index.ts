@@ -144,7 +144,7 @@ async function persistRenderedAsset(db:any,userId:string,runId:string,renderJobI
 async function validatePlatformForPublishing(db:any,userId:string,contentId:string,platform:string,runId:string|null){
   const errors:string[]=[];
   if(!platform)errors.push("PLATFORM_REQUIRED");
-  const {data:content}=await db.from("content").select("id,title,metadata,status").eq("id",contentId).eq("user_id",userId).maybeSingle();
+  const {data:content}=await db.from("content").select("id,title,metadata,status,updated_at").eq("id",contentId).eq("user_id",userId).maybeSingle();
   if(!content)errors.push("CONTENT_NOT_FOUND");
   if(content?.status!=="READY")errors.push("CONTENT_NOT_READY");
   let run:any=null;
@@ -165,8 +165,13 @@ async function validatePlatformForPublishing(db:any,userId:string,contentId:stri
   const {data:account}=await db.from("social_accounts").select("id,status,platform,scopes").eq("user_id",userId).eq("platform",platform.toLowerCase()).maybeSingle();
   if(!account||String(account.status).toUpperCase()!=="CONNECTED")errors.push("PLATFORM_NOT_CONNECTED");
   if(account?.scopes?.length===0)errors.push("PUBLISH_SCOPE_MISSING");
-  const {data:approval}=await db.from("approvals").select("id,status,action").eq("user_id",userId).eq("content_id",contentId).eq("status","APPROVED").order("decided_at",{ascending:false}).limit(1).maybeSingle();
+  const {data:approval}=await db.from("approvals").select("id,status,action,decided_at").eq("user_id",userId).eq("content_id",contentId).eq("status","APPROVED").order("decided_at",{ascending:false}).limit(1).maybeSingle();
+  const approvalAction=String(approval?.action||"").toLowerCase();
+  const actionMatches=!approvalAction||approvalAction.includes("publish")||approvalAction.includes("schedule");
+  const approvalFresh=!!approval?.decided_at&&!!content?.updated_at&&new Date(approval.decided_at).getTime()>=new Date(content.updated_at).getTime();
   if(!approval)errors.push("APPROVAL_REQUIRED");
+  else if(!actionMatches)errors.push("PUBLISH_APPROVAL_REQUIRED");
+  else if(!approvalFresh)errors.push("APPROVAL_STALE_AFTER_CONTENT_CHANGE");
   const platformRules:any={
     youtube:{maxBytes:256*1024*1024*1024,maxSeconds:12*60*60,ratios:["16:9","9:16","1:1"]},
     youtube_shorts:{maxBytes:256*1024*1024*1024,maxSeconds:180,ratios:["9:16"]},
