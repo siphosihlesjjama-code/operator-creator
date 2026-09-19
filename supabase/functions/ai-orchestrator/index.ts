@@ -151,6 +151,13 @@ if(body.action==="generate_image"){
   return json({status:"COMPLETED",asset});
  }catch(e:any){return json({status:"FAILED",error:e?.name==="AbortError"?"IMAGE_PROVIDER_TIMEOUT":"IMAGE_PROVIDER_ERROR"},502)}finally{clearTimeout(t)}
 }
+if(body.action==="generate_audio"){
+ const runId=String(body.production_run_id||"").trim(); if(!runId)return json({error:"production_run_id is required"},400);
+ const {data:run}=await db.from("production_runs").select("*").eq("id",runId).eq("user_id",user.id).maybeSingle(); if(!run)return json({error:"Production run not found"},404);
+ const provider=Deno.env.get("AUDIO_PROVIDER")||"";
+ if(!provider)return json({status:"PROVIDER_NOT_CONFIGURED",message:"Audio/music provider is not configured."},200);
+ return json({status:"PROVIDER_NOT_CONFIGURED",message:"Audio provider adapter is not implemented yet; no audio was fabricated."},200);
+}
 if(body.action==="production"){const prompt=String(body.prompt||"").trim();const workflow=(await db.from("workflows").insert({user_id:user.id,prompt,status:"QUEUED",metadata:{orchestrator:"ai-orchestrator",pipeline:true}}).select("*").single()).data;if(!workflow)return json({error:"Workflow creation failed"},500);let content=body.content_id?{id:body.content_id}:null;if(!content){content=(await db.from("content").insert({user_id:user.id,brand_id:body.brand_id||null,title:prompt.slice(0,120),content_type:"production_project",status:"QUEUED",platform:brief(prompt,body.brand_context).platform,prompt,metadata:{pipeline:true}}).select("id").single()).data}
 const result=await runPipeline(db,user,prompt,workflow.id,content?.id||null,body.brand_context||null);await db.from("workflows").update({status:result.status==="ready"?"COMPLETED":result.status==="PROVIDER_NOT_CONFIGURED"?"QUEUED":"FAILED",metadata:{pipeline:true,production_run_id:result.production_run_id}}).eq("id",workflow.id).eq("user_id",user.id);return json({workflow_id:workflow.id,content_id:content?.id||null,...result})}
 return json({error:"Use action=production for the production pipeline."},400)});
