@@ -267,9 +267,11 @@ if(body.action==="queue_render"){
  if(callbackBase)payload.callback=callbackBase.replace(/\/$/,"")+"/render-webhook";
  const submitted=await shotstackRequest(cfg.base+"/render",cfg.apiKey,{method:"POST",body:JSON.stringify(payload)});
  if(!submitted.ok){
-   const retryable=submitted.network||submitted.status===408||submitted.status===409||submitted.status===429||submitted.status>=500;
-   await db.from("render_jobs").update({status:retryable?"QUEUED":"FAILED",error_code:retryable?"PROVIDER_TRANSIENT_ERROR":"INVALID_PROVIDER_REQUEST",last_error:String(submitted.data?.message||submitted.data?.error||"Provider submission failed"),provider_status:"submission_failed"}).eq("id",job.id).eq("user_id",user.id);
-   return json({status:retryable?"QUEUED":"FAILED",render_job_id:job.id,error_code:retryable?"PROVIDER_TRANSIENT_ERROR":"INVALID_PROVIDER_REQUEST"},retryable?202:502);
+   const ambiguous=submitted.network||submitted.status>=500;
+   const retryable=!ambiguous&&(submitted.status===408||submitted.status===409||submitted.status===429);
+   const code=ambiguous?"SUBMISSION_UNKNOWN":retryable?"PROVIDER_TRANSIENT_ERROR":"INVALID_PROVIDER_REQUEST";
+   await db.from("render_jobs").update({status:ambiguous?"FAILED":retryable?"QUEUED":"FAILED",error_code:code,last_error:String(submitted.data?.message||submitted.data?.error||"Provider submission failed"),provider_status:"submission_failed"}).eq("id",job.id).eq("user_id",user.id);
+   return json({status:ambiguous?"FAILED":retryable?"QUEUED":"FAILED",render_job_id:job.id,error_code:code,message:ambiguous?"Provider submission outcome is unknown; the job will not be retried automatically to avoid duplicate renders.":undefined},ambiguous?502:retryable?202:502);
  }
  const providerJobId=String(submitted.data?.response?.id||submitted.data?.id||"");
  if(!providerJobId){
