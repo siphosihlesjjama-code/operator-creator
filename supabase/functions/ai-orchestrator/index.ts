@@ -95,6 +95,16 @@ if(body.action==="validate_render"){
  await audit(db,user.id,all?"final_media_qa_passed":"final_media_qa_failed","production_run",runId,{checks});
  return json({status:all?"PASSED":"FAILED",production_run_id:runId,checks},200);
 }
+if(body.action==="queue_render"){
+ const runId=String(body.production_run_id||"").trim(); if(!runId)return json({error:"production_run_id is required"},400);
+ const {data:run}=await db.from("production_runs").select("*").eq("id",runId).eq("user_id",user.id).maybeSingle(); if(!run)return json({error:"Production run not found"},404);
+ const {data:existing}=await db.from("render_jobs").select("id,status").eq("production_run_id",runId).eq("user_id",user.id).in("status",["QUEUED","PROCESSING","COMPLETED"]).limit(1).maybeSingle();
+ if(existing)return json({status:"ALREADY_QUEUED",render_job_id:existing.id,render_status:existing.status},200);
+ const {data:cap}=await db.from("caption_tracks").select("id").eq("production_run_id",runId).eq("user_id",user.id).order("created_at",{ascending:false}).limit(1).maybeSingle();
+ const provider=Deno.env.get("RENDER_PROVIDER")||"";
+ if(!provider){const r=await db.from("render_jobs").insert({user_id:user.id,production_run_id:runId,status:"PROVIDER_NOT_CONFIGURED",format:body.format||"mp4",aspect_ratio:body.aspect_ratio||"16:9",resolution:body.resolution||"1080p",caption_track_id:cap?.id||null,metadata:{reason:"No render provider configured"}}).select("id,status").single(); await db.from("production_runs").update({render_status:"PROVIDER_NOT_CONFIGURED",current_stage:"assembly"}).eq("id",runId).eq("user_id",user.id); return json({status:"PROVIDER_NOT_CONFIGURED",render_job_id:r.data?.id||null},200);}
+ return json({status:"PROVIDER_NOT_CONFIGURED",message:"Configured render provider adapter is not yet implemented."},200);
+}
 if(body.action==="generate_captions"){
  const runId=String(body.production_run_id||"").trim();
  if(!runId)return json({error:"production_run_id is required"},400);
