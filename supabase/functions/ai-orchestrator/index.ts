@@ -106,19 +106,37 @@ async function shotstackRequest(url:string,apiKey:string,init:RequestInit={}){
     return {ok:false,status:0,data:{error:e?.name==="AbortError"?"PROVIDER_TIMEOUT":String(e?.message||"NETWORK_ERROR")},network:true};
   }finally{clearTimeout(t)}
 }
-async function persistRenderedAsset(db:any,userId:string,runId:string,renderJobId:string,outputUrl:string,providerData:any,probe:any=null){
+async function persistRenderedAsset(db:any,userId:string,runId:string,renderJobId:string,outputUrl:string,providerData:any,probe:any=null,expectedAspect="16:9",expectedResolution="1080p"){
   const response=await fetch(outputUrl);
   if(!response.ok)throw new Error("RENDER_OUTPUT_DOWNLOAD_FAILED");
-  const type=response.headers.get("content-type")||"video/mp4";
+  const type=(response.headers.get("content-type")||"video/mp4").split(";")[0].toLowerCase();
   const bytes=new Uint8Array(await response.arrayBuffer());
   const maxBytes=250*1024*1024;
-  if(bytes.byteLength>maxBytes)throw new Error("RENDER_OUTPUT_TOO_LARGE");
+  const magicOk=bytes.byteLength>=12 && String.fromCharCode(...bytes.slice(4,8))==="ftyp";
+  const streams=Array.isArray(probe?.metadata?.streams)?probe.metadata.streams:Array.isArray(probe?.streams)?probe.streams:[];
+  const video=streams.find((s:any)=>String(s.codec_type||"").toLowerCase()==="video");
+  const audio=streams.find((s:any)=>String(s.codec_type||"").toLowerCase()==="audio");
+  const width=Number(probe?.metadata?.width||probe?.width||video?.width);
+  const height=Number(probe?.metadata?.height||probe?.height||video?.height);
+  const duration=Number(probe?.metadata?.duration||probe?.duration||video?.duration);
+  const expectedHeight=expectedResolution==="720p"?720:expectedResolution==="1080p"?1080:expectedResolution==="1440p"?1440:expectedResolution==="2160p"?2160:null;
+  const expectedRatio=expectedAspect==="9:16"?9/16:expectedAspect==="1:1"?1:expectedAspect==="4:5"?4/5:16/9;
+  const actualRatio=height>0?width/height:0;
+  if(type!=="video/mp4"||bytes.byteLength===0||bytes.byteLength>maxBytes||!magicOk)throw new Error("RENDER_OUTPUT_INVALID");
+  if(!video||width<=0||height<=0||duration<=0)throw new Error("FINAL_MEDIA_PROBE_INVALID");
+  if(expectedHeight&&height!==expectedHeight)throw new Error("FINAL_MEDIA_RESOLUTION_MISMATCH");
+  if(actualRatio<=0||Math.abs(actualRatio-expectedRatio)>=0.02)throw new Error("FINAL_MEDIA_ASPECT_MISMATCH");
   const path=userId+"/production/"+runId+"/final-"+renderJobId+".mp4";
-  const up=await db.storage.from("creator-assets").upload(path,bytes,{contentType:type,upsert:false});
-  if(up.error)throw new Error("RENDER_OUTPUT_STORAGE_FAILED");
+  const up=await db.storage.from("creator-assets").upload(path,bytes,{contentType:"video/mp4",upsert:false});
+  if(up.error){
+    if(!up.error.message?.toLowerCase().includes("already exists"))throw new Error("RENDER_OUTPUT_STORAGE_FAILED");
+    const existing=(await db.from("assets").select("id,storage_path,asset_type,mime_type,file_size_bytes,status,metadata").eq("user_id",userId).eq("storage_path",path).maybeSingle()).data;
+    if(existing)return existing;
+    throw new Error("RENDER_OUTPUT_STORAGE_RACE");
+  }
   const asset=(await db.from("assets").insert({
-    user_id:userId,storage_path:path,asset_type:"video",mime_type:type,file_size_bytes:bytes.byteLength,status:"READY",
-    metadata:{production_run_id:runId,render_job_id:renderJobId,provider:"shotstack",provider_output:providerData,probe:probe||null}
+    user_id:userId,storage_path:path,asset_type:"video",mime_type:"video/mp4",file_size_bytes:bytes.byteLength,status:"READY",
+    metadata:{production_run_id:runId,render_job_id:renderJobId,provider:"shotstack",provider_output:providerData,probe:probe||null,has_audio:!!audio}
   }).select("id,storage_path,asset_type,mime_type,file_size_bytes,status,metadata").single()).data;
   if(!asset)throw new Error("RENDER_OUTPUT_ASSET_RECORD_FAILED");
   return asset;
@@ -371,7 +389,7 @@ if(body.action==="poll_render"){
  if(!probe){await db.from("render_jobs").update({status:"FAILED",error_code:"FINAL_MEDIA_PROBE_FAILED",last_error:"Provider could not inspect the completed media."}).eq("id",job.id).eq("user_id",user.id);return json({status:"FAILED",render_job_id:job.id,error_code:"FINAL_MEDIA_PROBE_FAILED"},502);}
 
  try{
-   const asset=await persistRenderedAsset(db,user.id,runId,job.id,outputUrl,resp,probe);
+   const asset=await persistRenderedAsset(db,user.id,runId,job.id,outputUrl,resp,probe,String(job.aspect_ratio||"16:9"),String(job.resolution||"1080p"));
    await db.from("render_jobs").update({status:"COMPLETED",provider_status:"done",asset_id:asset.id,completed_at:now(),last_error:null}).eq("id",job.id).eq("user_id",user.id);
    await db.from("production_runs").update({render_status:"COMPLETED",current_stage:"final_qa",final_asset_id:asset.id}).eq("id",runId).eq("user_id",user.id);
    await audit(db,user.id,"render_completed","render_job",job.id,{provider:"shotstack",provider_job_id:job.provider_job_id,asset_id:asset.id});
