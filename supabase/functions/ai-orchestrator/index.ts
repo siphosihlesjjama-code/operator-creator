@@ -38,6 +38,38 @@ if(contentId){await db.from("content_versions").insert({user_id:user.id,content_
 await db.from("content_memory").insert({user_id:user.id,content_id:contentId,production_run_id:run.id,memory_type:"production",topic:prompt,fingerprint,data:{brief:run.brief,concepts:pack.concepts,quality:q,platform:run.brief.platform,status:finalStatus}}).catch(()=>{});
 await audit(db,user.id,"production_completed","production_run",run.id,{status:finalStatus,quality:q,provider:r.provider});return {production_run_id:run.id,status:finalStatus,provider:r.provider,model:r.model,quality:q,brief:run.brief,script:pack.script,storyboard:pack.storyboard,concepts:pack.concepts}}
 Deno.serve(async(req)=>{if(req.method==="OPTIONS")return new Response("ok",{headers});const auth=req.headers.get("Authorization");if(!auth)return json({error:"UNAUTHORIZED_NO_AUTH_HEADER"},401);const url=Deno.env.get("SUPABASE_URL")!;const key=Deno.env.get("SUPABASE_ANON_KEY")||Deno.env.get("SUPABASE_PUBLISHABLE_KEY")||JSON.parse(Deno.env.get("SUPABASE_PUBLISHABLE_KEYS")||"{}").default;const db=createClient(url,key,{global:{headers:{Authorization:auth}}});const {data:{user},error}=await db.auth.getUser();if(error||!user)return json({error:"UNAUTHORIZED"},401);const body=await req.json().catch(()=>null);if(!body?.prompt&&!body?.task_id)return json({error:"prompt or task_id is required"},400);
+if(body.action==="generate_scene_images"){
+ const runId=String(body.production_run_id||"").trim();
+ if(!runId)return json({error:"production_run_id is required"},400);
+ const {data:run,error:runErr}=await db.from("production_runs").select("*").eq("id",runId).eq("user_id",user.id).maybeSingle();
+ if(runErr||!run)return json({error:"Production run not found"},404);
+ const {data:story}=await db.from("production_stage_outputs").select("output").eq("production_run_id",runId).eq("user_id",user.id).eq("stage","storyboarding").order("created_at",{ascending:false}).limit(1).maybeSingle();
+ const scenes=Array.isArray(story?.output?.storyboard)?story.output.storyboard:[];
+ if(!scenes.length)return json({error:"No storyboard scenes available"},409);
+ const open=Deno.env.get("OPENAI_API_KEY"); if(!open)return json({status:"PROVIDER_NOT_CONFIGURED",message:"Image provider is not configured."},200);
+ const results:any[]=[];
+ for(const scene of scenes.slice(0,10)){
+  const sceneNo=Number(scene.scene_number||results.length+1);
+  const prompt="Create a production-ready cinematic visual for this video scene. Do not add readable text or logos. Match the described camera direction and visual style. Scene narration: "+String(scene.narration||"")+" Visual: "+String(scene.visual_description||"")+" Camera: "+String(scene.camera_direction||"")+" Mood/music direction: "+String(scene.music_direction||"");
+  const ac=new AbortController(); const timer=setTimeout(()=>ac.abort(),90000);
+  try{
+   const rr=await fetch("https://api.openai.com/v1/images/generations",{method:"POST",signal:ac.signal,headers:{"Authorization":"Bearer "+open,"Content-Type":"application/json"},body:JSON.stringify({model:Deno.env.get("OPENAI_IMAGE_MODEL")||"gpt-image-2",prompt,size:"1024x1024",quality:"medium",output_format:"png"})});
+   const data=await rr.json().catch(()=>({})); if(!rr.ok){results.push({scene_number:sceneNo,status:"FAILED",error:classify(rr.status,false).code});continue}
+   const b64=data?.data?.[0]?.b64_json; if(!b64){results.push({scene_number:sceneNo,status:"FAILED",error:"NO_IMAGE_DATA"});continue}
+   const bytes=Uint8Array.from(atob(b64),ch=>ch.charCodeAt(0)); const path=user.id+"/production/"+runId+"/scene-"+sceneNo+"-"+crypto.randomUUID()+".png";
+   const up=await db.storage.from("creator-assets").upload(path,bytes,{contentType:"image/png",upsert:false}); if(up.error){results.push({scene_number:sceneNo,status:"FAILED",error:"ASSET_STORAGE_FAILED"});continue}
+   const ins=await db.from("assets").insert({user_id:user.id,storage_path:path,asset_type:"image",mime_type:"image/png",file_size_bytes:bytes.byteLength,status:"READY",metadata:{production_run_id:runId,scene_number:sceneNo,source:"storyboard_scene"}}).select("id,storage_path,asset_type,mime_type,file_size_bytes").single();
+   if(ins.error){results.push({scene_number:sceneNo,status:"FAILED",error:"ASSET_RECORD_FAILED"});continue}
+   results.push({scene_number:sceneNo,status:"COMPLETED",asset:ins.data});
+  }catch(e){results.push({scene_number:sceneNo,status:"FAILED",error:e?.name==="AbortError"?"TIMEOUT":"NETWORK_ERROR"});}
+  finally{clearTimeout(timer)}
+ }
+ const completed=results.filter(x=>x.status==="COMPLETED").length;
+ await db.from("production_stage_outputs").insert({user_id:user.id,production_run_id:runId,stage:"media_generation",output:{scene_results:results,completed,total:results.length},provider:"openai",model:Deno.env.get("OPENAI_IMAGE_MODEL")||"gpt-image-2",attempt:1,status:completed?"COMPLETED":"FAILED"});
+ await db.from("production_runs").update({status:completed===results.length?"quality_check":"generating_media",current_stage:completed===results.length?"media_quality":"media_generation"}).eq("id",runId).eq("user_id",user.id);
+ await audit(db,user.id,"scene_media_generated","production_run",runId,{completed,total:results.length});
+ return json({status:completed===results.length?"COMPLETED":"PARTIAL",production_run_id:runId,scene_results:results},200);
+}
 if(body.action==="generate_image"){
  const prompt=String(body.prompt||"").trim(); if(!prompt)return json({error:"prompt is required"},400);
  const open=Deno.env.get("OPENAI_API_KEY"); if(!open)return json({status:"PROVIDER_NOT_CONFIGURED",message:"Image provider is not configured."},200);
