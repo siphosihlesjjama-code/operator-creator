@@ -1,0 +1,12 @@
+create index if not exists caption_tracks_content_idx on public.caption_tracks(content_id);
+create index if not exists production_media_links_user_idx on public.production_media_links(user_id);
+create index if not exists production_runs_caption_track_idx on public.production_runs(caption_track_id);
+create index if not exists production_runs_final_asset_idx on public.production_runs(final_asset_id);
+create index if not exists render_jobs_asset_idx on public.render_jobs(asset_id);
+create index if not exists render_jobs_caption_track_idx on public.render_jobs(caption_track_id);
+drop policy if exists caption_tracks_owner on public.caption_tracks;
+create policy caption_tracks_owner on public.caption_tracks for all using ((select auth.uid())=user_id) with check ((select auth.uid())=user_id);
+drop policy if exists render_jobs_owner on public.render_jobs;
+create policy render_jobs_owner on public.render_jobs for all using ((select auth.uid())=user_id) with check ((select auth.uid())=user_id);
+drop policy if exists production_media_links_owner on public.production_media_links;
+create policy production_media_links_owner on public.production_media_links for all using ((select auth.uid())=user_id) with check ((select auth.uid())=user_id);
