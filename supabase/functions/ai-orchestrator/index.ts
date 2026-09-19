@@ -37,7 +37,106 @@ const pass=q.status==="PASS"&&Number(q.overall_score)>=85;const finalStatus=pass
 if(contentId){await db.from("content_versions").insert({user_id:user.id,content_id:contentId,version_number:1,body:pack.script?.spoken_script||JSON.stringify(pack.script||{}),asset_ids:[]});await db.from("content").update({status:pass?"READY":"FAILED",metadata:{workflow_id:workflowId,production_run_id:run.id,quality:q,platform:run.brief.platform}}).eq("id",contentId).eq("user_id",user.id)}
 await db.from("content_memory").insert({user_id:user.id,content_id:contentId,production_run_id:run.id,memory_type:"production",topic:prompt,fingerprint,data:{brief:run.brief,concepts:pack.concepts,quality:q,platform:run.brief.platform,status:finalStatus}}).catch(()=>{});
 await audit(db,user.id,"production_completed","production_run",run.id,{status:finalStatus,quality:q,provider:r.provider});return {production_run_id:run.id,status:finalStatus,provider:r.provider,model:r.model,quality:q,brief:run.brief,script:pack.script,storyboard:pack.storyboard,concepts:pack.concepts}}
-Deno.serve(async(req)=>{if(req.method==="OPTIONS")return new Response("ok",{headers});const auth=req.headers.get("Authorization");if(!auth)return json({error:"UNAUTHORIZED_NO_AUTH_HEADER"},401);const url=Deno.env.get("SUPABASE_URL")!;const key=Deno.env.get("SUPABASE_ANON_KEY")||Deno.env.get("SUPABASE_PUBLISHABLE_KEY")||JSON.parse(Deno.env.get("SUPABASE_PUBLISHABLE_KEYS")||"{}").default;const db=createClient(url,key,{global:{headers:{Authorization:auth}}});const {data:{user},error}=await db.auth.getUser();if(error||!user)return json({error:"UNAUTHORIZED"},401);const body=await req.json().catch(()=>null);if(!body?.prompt&&!body?.task_id)return json({error:"prompt or task_id is required"},400);
+
+function renderConfig(){
+  const provider=Deno.env.get("RENDER_PROVIDER")||"";
+  const apiKey=Deno.env.get("SHOTSTACK_API_KEY")||"";
+  const env=Deno.env.get("SHOTSTACK_ENV")||"stage";
+  const version=env==="v1"?"v1":"stage";
+  return {provider,apiKey,version,base:"https://api.shotstack.io/edit/"+version};
+}
+function renderIdempotency(userId:string,runId:string,format:string,aspect:string,resolution:string){
+  return "render:"+userId+":"+runId+":"+format+":"+aspect+":"+resolution;
+}
+function renderDimensions(aspect:string,resolution:string){
+  const r=resolution==="720p"?720:resolution==="1080p"?1080:resolution==="1440p"?1440:2160;
+  if(aspect==="9:16")return {width:Math.round(r*9/16),height:r};
+  if(aspect==="1:1")return {width:r,height:r};
+  if(aspect==="4:5")return {width:Math.round(r*4/5),height:r};
+  return {width:Math.round(r*16/9),height:r};
+}
+function providerRenderStatus(s:string){
+  if(["queued","fetching","preprocessing"].includes(s))return "QUEUED";
+  if(["rendering","generating","saving"].includes(s))return "PROCESSING";
+  if(s==="done")return "COMPLETED";
+  if(s==="failed")return "FAILED";
+  return "PROCESSING";
+}
+async function shotstackRequest(url:string,apiKey:string,init:RequestInit={}){
+  const c=new AbortController(); const t=setTimeout(()=>c.abort(),60000);
+  try{
+    const r=await fetch(url,{...init,signal:c.signal,headers:{"Accept":"application/json","Content-Type":"application/json","x-api-key":apiKey,...(init.headers||{})}});
+    const data=await r.json().catch(()=>({}));
+    return {ok:r.ok,status:r.status,data,network:false};
+  }catch(e:any){
+    return {ok:false,status:0,data:{error:e?.name==="AbortError"?"PROVIDER_TIMEOUT":String(e?.message||"NETWORK_ERROR")},network:true};
+  }finally{clearTimeout(t)}
+}
+async function persistRenderedAsset(db:any,userId:string,runId:string,renderJobId:string,outputUrl:string,providerData:any){
+  const response=await fetch(outputUrl);
+  if(!response.ok)throw new Error("RENDER_OUTPUT_DOWNLOAD_FAILED");
+  const type=response.headers.get("content-type")||"video/mp4";
+  const bytes=new Uint8Array(await response.arrayBuffer());
+  const maxBytes=250*1024*1024;
+  if(bytes.byteLength>maxBytes)throw new Error("RENDER_OUTPUT_TOO_LARGE");
+  const path=userId+"/production/"+runId+"/final-"+renderJobId+".mp4";
+  const up=await db.storage.from("creator-assets").upload(path,bytes,{contentType:type,upsert:false});
+  if(up.error)throw new Error("RENDER_OUTPUT_STORAGE_FAILED");
+  const asset=(await db.from("assets").insert({
+    user_id:userId,storage_path:path,asset_type:"video",mime_type:type,file_size_bytes:bytes.byteLength,status:"READY",
+    metadata:{production_run_id:runId,render_job_id:renderJobId,provider:"shotstack",provider_output:providerData}
+  }).select("id,storage_path,asset_type,mime_type,file_size_bytes,status,metadata").single()).data;
+  if(!asset)throw new Error("RENDER_OUTPUT_ASSET_RECORD_FAILED");
+  return asset;
+}
+async function validatePlatformForPublishing(db:any,userId:string,contentId:string,platform:string,runId:string|null){
+  const errors:string[]=[];
+  if(!platform)errors.push("PLATFORM_REQUIRED");
+  const {data:content}=await db.from("content").select("id,title,metadata,status").eq("id",contentId).eq("user_id",userId).maybeSingle();
+  if(!content)errors.push("CONTENT_NOT_FOUND");
+  if(content?.status!=="READY")errors.push("CONTENT_NOT_READY");
+  let run:any=null;
+  if(runId){run=(await db.from("production_runs").select("*").eq("id",runId).eq("user_id",userId).maybeSingle()).data;}
+  if(runId&&!run)errors.push("PRODUCTION_RUN_NOT_FOUND");
+  if(run&&run.status!=="ready")errors.push("PRODUCTION_NOT_READY");
+  const finalId=run?.final_asset_id||null;
+  if(runId&&!finalId)errors.push("FINAL_ASSET_REQUIRED");
+  if(finalId){
+    const {data:asset}=await db.from("assets").select("id,status,mime_type,file_size_bytes,metadata").eq("id",finalId).eq("user_id",userId).maybeSingle();
+    if(!asset)errors.push("FINAL_ASSET_NOT_FOUND");
+    else{
+      if(asset.status!=="READY")errors.push("FINAL_ASSET_NOT_READY");
+      if(asset.mime_type!=="video/mp4")errors.push("FINAL_ASSET_MUST_BE_MP4");
+      if(!Number(asset.file_size_bytes)||Number(asset.file_size_bytes)<=0)errors.push("FINAL_ASSET_EMPTY");
+    }
+  }
+  const {data:account}=await db.from("social_accounts").select("id,status,platform,scopes").eq("user_id",userId).eq("platform",platform.toLowerCase()).maybeSingle();
+  if(!account||String(account.status).toUpperCase()!=="CONNECTED")errors.push("PLATFORM_NOT_CONNECTED");
+  if(account?.scopes?.length===0)errors.push("PUBLISH_SCOPE_MISSING");
+  const {data:approval}=await db.from("approvals").select("id,status,action").eq("user_id",userId).eq("content_id",contentId).eq("status","APPROVED").order("decided_at",{ascending:false}).limit(1).maybeSingle();
+  if(!approval)errors.push("APPROVAL_REQUIRED");
+  const platformRules:any={
+    youtube:{maxBytes:256*1024*1024*1024,maxSeconds:12*60*60,ratios:["16:9","9:16","1:1"]},
+    youtube_shorts:{maxBytes:256*1024*1024*1024,maxSeconds:180,ratios:["9:16"]},
+    instagram:{maxBytes:250*1024*1024,maxSeconds:90,ratios:["9:16","1:1","4:5","16:9"]},
+    tiktok:{maxBytes:4*1024*1024*1024,maxSeconds:600,ratios:["9:16","1:1","16:9"]},
+    facebook:{maxBytes:4*1024*1024*1024,maxSeconds:240,ratios:["9:16","1:1","16:9"]},
+    linkedin:{maxBytes:200*1024*1024,maxSeconds:600,ratios:["9:16","1:1","16:9"]},
+    x:{maxBytes:512*1024*1024,maxSeconds:140,ratios:["16:9","9:16","1:1"]},
+    pinterest:{maxBytes:2*1024*1024*1024,maxSeconds:900,ratios:["9:16","1:1","4:5","16:9"]}
+  };
+  const rule=platformRules[platform.toLowerCase()];
+  if(!rule)errors.push("UNSUPPORTED_PLATFORM");
+  if(run?.brief?.aspect_ratio&&rule&&!rule.ratios.includes(run.brief.aspect_ratio))errors.push("ASPECT_RATIO_NOT_SUPPORTED");
+  if(run?.brief?.duration_seconds&&rule&&Number(run.brief.duration_seconds)>rule.maxSeconds)errors.push("DURATION_EXCEEDS_PLATFORM_LIMIT");
+  if(finalId&&rule){
+    const a=(await db.from("assets").select("file_size_bytes").eq("id",finalId).eq("user_id",userId).maybeSingle()).data;
+    if(a&&Number(a.file_size_bytes)>rule.maxBytes)errors.push("FILE_SIZE_EXCEEDS_PLATFORM_LIMIT");
+  }
+  return {valid:errors.length===0,errors};
+}
+
+Deno.serve(async(req)=>{if(req.method==="OPTIONS")return new Response("ok",{headers});const auth=req.headers.get("Authorization");if(!auth)return json({error:"UNAUTHORIZED_NO_AUTH_HEADER"},401);const url=Deno.env.get("SUPABASE_URL")!;const key=Deno.env.get("SUPABASE_ANON_KEY")||Deno.env.get("SUPABASE_PUBLISHABLE_KEY")||JSON.parse(Deno.env.get("SUPABASE_PUBLISHABLE_KEYS")||"{}").default;const db=createClient(url,key,{global:{headers:{Authorization:auth}}});const {data:{user},error}=await db.auth.getUser();if(error||!user)return json({error:"UNAUTHORIZED"},401);const body=await req.json().catch(()=>null);const action=String(body?.action||""); const actionOnly=["production","generate_scene_images","generate_captions","generate_voice","generate_image","generate_audio","validate_render","queue_render","poll_render","validate_publish","publish"]; if(!body?.prompt&&!body?.task_id&&!actionOnly.includes(action))return json({error:"prompt or task_id or supported action is required"},400);
 if(body.action==="generate_scene_images"){
  const runId=String(body.production_run_id||"").trim();
  if(!runId)return json({error:"production_run_id is required"},400);
@@ -98,12 +197,117 @@ if(body.action==="validate_render"){
 if(body.action==="queue_render"){
  const runId=String(body.production_run_id||"").trim(); if(!runId)return json({error:"production_run_id is required"},400);
  const {data:run}=await db.from("production_runs").select("*").eq("id",runId).eq("user_id",user.id).maybeSingle(); if(!run)return json({error:"Production run not found"},404);
- const {data:existing}=await db.from("render_jobs").select("id,status").eq("production_run_id",runId).eq("user_id",user.id).in("status",["QUEUED","PROCESSING","COMPLETED"]).limit(1).maybeSingle();
- if(existing)return json({status:"ALREADY_QUEUED",render_job_id:existing.id,render_status:existing.status},200);
- const {data:cap}=await db.from("caption_tracks").select("id").eq("production_run_id",runId).eq("user_id",user.id).order("created_at",{ascending:false}).limit(1).maybeSingle();
- const provider=Deno.env.get("RENDER_PROVIDER")||"";
- if(!provider){const r=await db.from("render_jobs").insert({user_id:user.id,production_run_id:runId,status:"PROVIDER_NOT_CONFIGURED",format:body.format||"mp4",aspect_ratio:body.aspect_ratio||"16:9",resolution:body.resolution||"1080p",caption_track_id:cap?.id||null,metadata:{reason:"No render provider configured"}}).select("id,status").single(); await db.from("production_runs").update({render_status:"PROVIDER_NOT_CONFIGURED",current_stage:"assembly"}).eq("id",runId).eq("user_id",user.id); return json({status:"PROVIDER_NOT_CONFIGURED",render_job_id:r.data?.id||null},200);}
- return json({status:"PROVIDER_NOT_CONFIGURED",message:"Configured render provider adapter is not yet implemented."},200);
+ if(!["ready","quality_check","assembling","generating_media"].includes(run.status))return json({status:"INVALID_RUN_STATE",message:"Production run is not eligible for rendering from its current state."},409);
+ const format=String(body.format||"mp4"); const aspect=String(body.aspect_ratio||"16:9"); const resolution=String(body.resolution||"1080p");
+ const idempotencyKey=renderIdempotency(user.id,runId,format,aspect,resolution);
+ const {data:cap}=await db.from("caption_tracks").select("id,cues").eq("production_run_id",runId).eq("user_id",user.id).order("created_at",{ascending:false}).limit(1).maybeSingle();
+ const {data:links}=await db.from("production_media_links").select("scene_number,asset_id").eq("production_run_id",runId).eq("user_id",user.id).eq("role","scene_visual").order("scene_number");
+ if(!cap)return json({status:"VALIDATION_FAILED",errors:["CAPTION_TRACK_REQUIRED"]},409);
+ if(!links?.length)return json({status:"VALIDATION_FAILED",errors:["SCENE_MEDIA_REQUIRED"]},409);
+ const cfg=renderConfig();
+ if(cfg.provider!=="shotstack"||!cfg.apiKey){
+   const existing=(await db.from("render_jobs").select("id,status").eq("user_id",user.id).eq("idempotency_key",idempotencyKey).maybeSingle()).data;
+   if(existing)return json({status:"ALREADY_QUEUED",render_job_id:existing.id,render_status:existing.status},200);
+   const ins=await db.from("render_jobs").insert({user_id:user.id,production_run_id:runId,status:"PROVIDER_NOT_CONFIGURED",format,aspect_ratio:aspect,resolution,caption_track_id:cap.id,idempotency_key:idempotencyKey,provider:"shotstack",metadata:{reason:"SHOTSTACK_API_KEY or RENDER_PROVIDER is not configured"}}).select("id,status").single();
+   await db.from("production_runs").update({render_status:"PROVIDER_NOT_CONFIGURED",current_stage:"assembly"}).eq("id",runId).eq("user_id",user.id);
+   return json({status:"PROVIDER_NOT_CONFIGURED",render_job_id:ins.data?.id||null,message:"Shotstack render provider is not configured."},200);
+ }
+ const existing=(await db.from("render_jobs").select("*").eq("user_id",user.id).eq("idempotency_key",idempotencyKey).maybeSingle()).data;
+ if(existing){
+   if(existing.status==="COMPLETED")return json({status:"COMPLETED",render_job_id:existing.id,render_status:"COMPLETED"},200);
+   if(existing.provider_job_id)return json({status:existing.status,render_job_id:existing.id,provider_job_id:existing.provider_job_id},200);
+   if(existing.status==="PROCESSING"||existing.status==="QUEUED")return json({status:existing.status,render_job_id:existing.id},200);
+ }
+ let job=existing;
+ if(!job){
+   const ins=await db.from("render_jobs").insert({user_id:user.id,production_run_id:runId,status:"QUEUED",format,aspect_ratio:aspect,resolution,caption_track_id:cap.id,idempotency_key:idempotencyKey,provider:"shotstack",attempt_number:1,max_attempts:3}).select("*").single();
+   if(ins.error){
+     const race=(await db.from("render_jobs").select("*").eq("user_id",user.id).eq("idempotency_key",idempotencyKey).maybeSingle()).data;
+     if(race)return json({status:race.status,render_job_id:race.id,provider_job_id:race.provider_job_id||null},200);
+     return json({status:"FAILED",error:"RENDER_JOB_CREATE_FAILED"},500);
+   }
+   job=ins.data;
+ }
+ const {data:story}=await db.from("production_stage_outputs").select("output").eq("production_run_id",runId).eq("user_id",user.id).eq("stage","storyboarding").order("created_at",{ascending:false}).limit(1).maybeSingle();
+ const scenes=Array.isArray(story?.output?.storyboard)?story.output.storyboard:[];
+ const clips:any[]=[]; const signedAssets:any[]=[];
+ for(const link of links){
+   const scene=scenes.find((s:any)=>Number(s.scene_number)===Number(link.scene_number));
+   const {data:asset}=await db.from("assets").select("id,storage_path,status").eq("id",link.asset_id).eq("user_id",user.id).maybeSingle();
+   if(!asset||asset.status!=="READY")return json({status:"VALIDATION_FAILED",render_job_id:job.id,errors:["SCENE_ASSET_NOT_READY:"+String(link.scene_number)]},409);
+   const signed=await db.storage.from("creator-assets").createSignedUrl(asset.storage_path,3600);
+   if(signed.error||!signed.data?.signedUrl)return json({status:"VALIDATION_FAILED",render_job_id:job.id,errors:["SCENE_ASSET_SIGNED_URL_FAILED:"+String(link.scene_number)]},409);
+   signedAssets.push(signed.data.signedUrl);
+   const start=Number(scene?.start_time||0); const length=Math.max(0.5,Number(scene?.duration||0)||(Number(scene?.end_time||start+3)-start));
+   clips.push({asset:{type:"image",src:signed.data.signedUrl},start,length,fit:"cover",effect:"zoomIn"});
+ }
+ const cues=Array.isArray(cap.cues)?cap.cues:[];
+ const captionClips=cues.map((cue:any)=>({asset:{type:"text",text:String(cue.text||""),width:1500,height:180,font:{family:"Open Sans",color:"#ffffff",size:42,weight:700,lineHeight:1},background:{color:"#000000",opacity:0.65,padding:12,borderRadius:8,wrap:true},alignment:{horizontal:"center",vertical:"center"},stroke:{width:1,color:"#000000"}},start:Number(cue.start),length:Math.max(0.2,Number(cue.end)-Number(cue.start)),position:"bottom"}));
+ const dims=renderDimensions(aspect,resolution);
+ const timeline={background:"#000000",tracks:[{clips},{clips:captionClips}]};
+ const callbackBase=Deno.env.get("PUBLIC_FUNCTION_BASE_URL")||"";
+ const payload:any={timeline,output:{format:"mp4",size:dims,fps:30,thumbnail:{capture:1}}};
+ if(callbackBase)payload.callback=callbackBase.replace(/\/$/,"")+"/render-webhook";
+ const submitted=await shotstackRequest(cfg.base+"/render",cfg.apiKey,{method:"POST",body:JSON.stringify(payload)});
+ if(!submitted.ok){
+   const retryable=submitted.network||submitted.status===408||submitted.status===409||submitted.status===429||submitted.status>=500;
+   await db.from("render_jobs").update({status:retryable?"QUEUED":"FAILED",error_code:retryable?"PROVIDER_TRANSIENT_ERROR":"INVALID_PROVIDER_REQUEST",last_error:String(submitted.data?.message||submitted.data?.error||"Provider submission failed"),provider_status:"submission_failed"}).eq("id",job.id).eq("user_id",user.id);
+   return json({status:retryable?"QUEUED":"FAILED",render_job_id:job.id,error_code:retryable?"PROVIDER_TRANSIENT_ERROR":"INVALID_PROVIDER_REQUEST"},retryable?202:502);
+ }
+ const providerJobId=String(submitted.data?.response?.id||submitted.data?.id||"");
+ if(!providerJobId){
+   await db.from("render_jobs").update({status:"FAILED",error_code:"PROVIDER_NO_JOB_ID",last_error:"Render provider accepted a response without a job id."}).eq("id",job.id).eq("user_id",user.id);
+   return json({status:"FAILED",render_job_id:job.id,error_code:"PROVIDER_NO_JOB_ID"},502);
+ }
+ const mapped=providerRenderStatus(String(submitted.data?.response?.status||"queued"));
+ await db.from("render_jobs").update({status:mapped,provider_job_id:providerJobId,provider_status:String(submitted.data?.response?.status||"queued"),started_at:mapped==="PROCESSING"?now():null,last_error:null}).eq("id",job.id).eq("user_id",user.id);
+ await db.from("production_runs").update({render_status:mapped,current_stage:"assembly"}).eq("id",runId).eq("user_id",user.id);
+ await audit(db,user.id,"render_submitted","render_job",job.id,{provider:"shotstack",provider_job_id:providerJobId,attempt:job.attempt_number});
+ return json({status:mapped,render_job_id:job.id,provider_job_id:providerJobId,provider:"shotstack"},202);
+}
+if(body.action==="poll_render"){
+ const runId=String(body.production_run_id||"").trim(); const renderJobId=String(body.render_job_id||"").trim();
+ if(!runId||!renderJobId)return json({error:"production_run_id and render_job_id are required"},400);
+ const {data:job}=await db.from("render_jobs").select("*").eq("id",renderJobId).eq("production_run_id",runId).eq("user_id",user.id).maybeSingle();
+ if(!job)return json({error:"Render job not found"},404);
+ if(job.status==="COMPLETED"||job.status==="FAILED"||job.status==="PROVIDER_NOT_CONFIGURED")return json({status:job.status,render_job_id:job.id,asset_id:job.asset_id||null},200);
+ const cfg=renderConfig(); if(cfg.provider!=="shotstack"||!cfg.apiKey)return json({status:"PROVIDER_NOT_CONFIGURED",render_job_id:job.id},200);
+ if(!job.provider_job_id)return json({status:job.status,error_code:"PROVIDER_JOB_ID_MISSING",render_job_id:job.id},409);
+ const polled=await shotstackRequest(cfg.base+"/render/"+encodeURIComponent(job.provider_job_id),cfg.apiKey,{method:"GET"});
+ if(!polled.ok){
+   const retryable=polled.network||polled.status===408||polled.status===409||polled.status===429||polled.status>=500;
+   const attempts=Number(job.attempt_number||1);
+   if(!retryable||attempts>=Number(job.max_attempts||3)){
+     await db.from("render_jobs").update({status:"FAILED",error_code:retryable?"RETRY_LIMIT_EXCEEDED":"PROVIDER_STATUS_ERROR",last_error:String(polled.data?.message||polled.data?.error||"Provider status request failed")}).eq("id",job.id).eq("user_id",user.id);
+     return json({status:"FAILED",render_job_id:job.id,error_code:retryable?"RETRY_LIMIT_EXCEEDED":"PROVIDER_STATUS_ERROR"},502);
+   }
+   const next=new Date(Date.now()+Math.min(15*60*1000,Math.pow(2,attempts)*5000)).toISOString();
+   await db.from("render_jobs").update({status:"QUEUED",attempt_number:attempts+1,next_retry_at:next,last_error:"Provider status request transient failure"}).eq("id",job.id).eq("user_id",user.id);
+   return json({status:"QUEUED",render_job_id:job.id,next_retry_at:next},202);
+ }
+ const resp=polled.data?.response||polled.data||{}; const mapped=providerRenderStatus(String(resp.status||"queued"));
+ if(mapped==="FAILED"){
+   await db.from("render_jobs").update({status:"FAILED",provider_status:String(resp.status||"failed"),error_code:"PROVIDER_RENDER_FAILED",last_error:String(resp.error||"Provider render failed"),completed_at:now()}).eq("id",job.id).eq("user_id",user.id);
+   await db.from("production_runs").update({render_status:"FAILED",current_stage:"assembly"}).eq("id",runId).eq("user_id",user.id);
+   await audit(db,user.id,"render_failed","render_job",job.id,{provider:"shotstack",provider_job_id:job.provider_job_id,error:String(resp.error||"Provider render failed")});
+   return json({status:"FAILED",render_job_id:job.id,error_code:"PROVIDER_RENDER_FAILED"},200);
+ }
+ if(mapped!=="COMPLETED"){
+   await db.from("render_jobs").update({status:mapped,provider_status:String(resp.status||"processing"),started_at:job.started_at||now()}).eq("id",job.id).eq("user_id",user.id);
+   await db.from("production_runs").update({render_status:mapped,current_stage:"assembly"}).eq("id",runId).eq("user_id",user.id);
+   return json({status:mapped,render_job_id:job.id,provider_status:resp.status},200);
+ }
+ const outputUrl=String(resp.url||""); if(!outputUrl)return json({status:"PROCESSING",render_job_id:job.id,error_code:"PROVIDER_OUTPUT_NOT_READY"},202);
+ try{
+   const asset=await persistRenderedAsset(db,user.id,runId,job.id,outputUrl,resp);
+   await db.from("render_jobs").update({status:"COMPLETED",provider_status:"done",asset_id:asset.id,completed_at:now(),last_error:null}).eq("id",job.id).eq("user_id",user.id);
+   await db.from("production_runs").update({render_status:"COMPLETED",current_stage:"final_qa",final_asset_id:asset.id}).eq("id",runId).eq("user_id",user.id);
+   await audit(db,user.id,"render_completed","render_job",job.id,{provider:"shotstack",provider_job_id:job.provider_job_id,asset_id:asset.id});
+   return json({status:"COMPLETED",render_job_id:job.id,asset_id:asset.id},200);
+ }catch(e:any){
+   await db.from("render_jobs").update({status:"FAILED",error_code:"FINAL_ASSET_PERSIST_FAILED",last_error:String(e?.message||"Failed to persist rendered asset"),completed_at:now()}).eq("id",job.id).eq("user_id",user.id);
+   return json({status:"FAILED",render_job_id:job.id,error_code:"FINAL_ASSET_PERSIST_FAILED"},500);
+ }
 }
 if(body.action==="generate_captions"){
  const runId=String(body.production_run_id||"").trim();
@@ -119,10 +323,9 @@ if(body.action==="generate_captions"){
  const ins=await db.from("caption_tracks").insert({user_id:user.id,production_run_id:runId,content_id:run.content_id,language:run.brief?.language==="English"?"en":"en",format:"webvtt",status:"READY",cues,source:"script_deterministic_v1"}).select("id").single();
  if(ins.error)return json({status:"FAILED",error:"CAPTION_PERSIST_FAILED"},500);
  await db.from("production_runs").update({caption_track_id:ins.data.id,render_status:"QUEUED",current_stage:"assembly"}).eq("id",runId).eq("user_id",user.id);
- const render=await db.from("render_jobs").insert({user_id:user.id,production_run_id:runId,status:"QUEUED",format:body.format||"mp4",aspect_ratio:body.aspect_ratio||"16:9",resolution:body.resolution||"1080p",caption_track_id:ins.data.id,provider:"assembly_pending",metadata:{reason:"No configured video renderer/provider yet"}}).select("id,status").single();
  await db.from("production_stage_outputs").insert({user_id:user.id,production_run_id:runId,stage:"captions",output:{caption_track_id:ins.data.id,cue_count:cues.length},provider:"operator_creator",model:"deterministic_caption_v1",attempt:1,status:"COMPLETED"});
  await audit(db,user.id,"captions_generated","production_run",runId,{caption_track_id:ins.data.id,cue_count:cues.length});
- return json({status:"COMPLETED",production_run_id:runId,caption_track_id:ins.data.id,render_job:render.data||null,cues});
+ return json({status:"COMPLETED",production_run_id:runId,caption_track_id:ins.data.id,cues});
 }
 if(body.action==="generate_voice"){
  const runId=String(body.production_run_id||"").trim(); const sourceAssetId=String(body.source_asset_id||"").trim();
