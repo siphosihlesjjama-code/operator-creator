@@ -78,7 +78,7 @@ if(body.action==="generate_captions"){
  const {data:scriptStage}=await db.from("production_stage_outputs").select("output").eq("production_run_id",runId).eq("user_id",user.id).eq("stage","writing").order("created_at",{ascending:false}).limit(1).maybeSingle();
  const script=String(scriptStage?.output?.script?.spoken_script||"").trim();
  if(!script)return json({error:"No spoken script available"},409);
- const words=script.split(/\s+/).filter(Boolean); const duration=Math.max(1,Number(run.brief?.duration_seconds||run.brief?.duration||60));
+ const words=script.split(/\s+/).filter(Boolean); const rawDuration=Number(run.brief?.duration_seconds); const duration=Number.isFinite(rawDuration)&&rawDuration>0?rawDuration:60;
  const chunk=Math.max(1,Math.ceil(words.length/Math.max(1,Math.ceil(duration/3))));
  const cues:any[]=[]; for(let i=0;i<words.length;i+=chunk){const part=words.slice(i,i+chunk);const start=Math.min(duration-0.1,(i/words.length)*duration);const end=Math.min(duration,(Math.min(words.length,i+chunk)/words.length)*duration);cues.push({start:Math.round(start*100)/100,end:Math.round(Math.max(start+0.2,end)*100)/100,text:part.join(" ")});}
  const ins=await db.from("caption_tracks").insert({user_id:user.id,production_run_id:runId,content_id:run.content_id,language:run.brief?.language==="English"?"en":"en",format:"webvtt",status:"READY",cues,source:"script_deterministic_v1"}).select("id").single();
