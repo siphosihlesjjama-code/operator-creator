@@ -14,7 +14,8 @@
     "vite": "latest",
     "typescript": "latest",
     "react": "latest",
-    "react-dom": "latest"
+    "react-dom": "latest",
+    "tus-js-client": "latest"
   },
   "devDependencies": {
     "@types/react": "latest",
