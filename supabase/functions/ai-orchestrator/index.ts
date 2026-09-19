@@ -262,7 +262,7 @@ if(body.action==="queue_render"){
  const captionClips=cues.map((cue:any)=>({asset:{type:"text",text:String(cue.text||""),width:1500,height:180,font:{family:"Open Sans",color:"#ffffff",size:42,weight:700,lineHeight:1},background:{color:"#000000",opacity:0.65,padding:12,borderRadius:8,wrap:true},alignment:{horizontal:"center",vertical:"center"},stroke:{width:1,color:"#000000"}},start:Number(cue.start),length:Math.max(0.2,Number(cue.end)-Number(cue.start)),position:"bottom"}));
  const dims=renderDimensions(aspect,resolution);
  const timeline={background:"#000000",tracks:[{clips},{clips:captionClips}]};
- const callbackBase=Deno.env.get("PUBLIC_FUNCTION_BASE_URL")||"";
+ const callbackBase=Deno.env.get("PUBLIC_FUNCTION_BASE_URL")||"https://fvjieqombgolkxvbjwsk.supabase.co/functions/v1";
  const payload:any={timeline,output:{format:"mp4",size:dims,fps:30,thumbnail:{capture:1}}};
  if(callbackBase)payload.callback=callbackBase.replace(/\/$/,"")+"/render-webhook";
  const submitted=await shotstackRequest(cfg.base+"/render",cfg.apiKey,{method:"POST",body:JSON.stringify(payload)});
